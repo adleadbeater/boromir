@@ -272,46 +272,62 @@ def fetch_flixpatrol(target_date):
 # FLIXPATROL — US TOP 10
 # ─────────────────────────────────────────────────────────────────────────────
 
-def fetch_us_top10(target_date):
-    """Fetch US aggregate rankings; return top-10 movies and top-10 TV shows."""
-    session = _build_session(auth=(os.environ["FLIXPATROL_API_KEY"], ""))
-    log.info("Fetching US rankings for %s", target_date)
-
-    items = fp_get(session, "rankings", {
-        "date[type][eq]": 1,
-        "date[from][eq]": target_date,
-        "date[to][eq]":   target_date,
-        "audience[eq]":   1,
-        "country[in]":    US_COUNTRY,
-    })
-
+def derive_us_top10(all_titles):
+    """
+    Build a consolidated US Top 10 from already-fetched platform top10s data.
+    The top10s calls already used country[in]=US_COUNTRY, so every entry in
+    title["top10"] reflects a US chart position.  We pick each title's best
+    platform slot (lowest rank on highest tier), then sort movies and TV
+    separately.
+    """
     movies, tv = [], []
-    for item in items:
-        d     = item.get("data", item)
-        inner = _inner(d.get("movie", {}))
-        tid   = inner.get("id")
-        if not tid:
+
+    for t in all_titles:
+        if not t.get("top10"):
             continue
-        rank = d.get("ranking")
-        if not rank:
+        mt = t.get("media_type", "unknown")
+        if mt not in ("movie", "tv"):
             continue
+
+        best_rank      = None
+        best_rank_last = None
+        best_plat      = ""
+        best_key       = (99, 99)
+        best_days      = 0
+
+        for p, types in t["top10"].items():
+            tier = TIER_MAP.get(p, 5)
+            for ct, data in types.items():
+                rank = data.get("ranking") or 99
+                if (tier, rank) < best_key:
+                    best_key       = (tier, rank)
+                    best_rank      = data.get("ranking")
+                    best_rank_last = data.get("ranking_last")
+                    best_plat      = p
+                    best_days      = data.get("days_total") or 0
+
+        if best_rank is None:
+            continue
+
         entry = {
-            "flixpatrol_id": tid,
-            "title":         inner.get("title") or tid,
-            "us_rank":       rank,
-            "us_rank_last":  d.get("rankingLast"),
-            "days_total":    d.get("daysTotal") or 0,
+            "flixpatrol_id": t["flixpatrol_id"],
+            "title":         t["title"],
+            "platform":      best_plat,
+            "plat_rank":     best_rank,
+            "plat_rank_last":best_rank_last,
+            "days_total":    t.get("days_total") or best_days,
+            "_tier":         best_key[0],
         }
-        ctype = d.get("type")
-        if ctype == 1:
+        if mt == "movie":
             movies.append(entry)
-        elif ctype == 2:
+        else:
             tv.append(entry)
 
-    movies.sort(key=lambda x: x["us_rank"])
-    tv.sort(key=lambda x: x["us_rank"])
-    log.info("US Top 10: %d movies, %d TV shows fetched",
-             min(len(movies), 10), min(len(tv), 10))
+    # Sort: tier-1 platforms first, then by rank within tier
+    movies.sort(key=lambda x: (x["_tier"], x["plat_rank"]))
+    tv.sort(key=lambda x: (x["_tier"], x["plat_rank"]))
+    log.info("US Top 10 derived: %d movies, %d TV in pool",
+             len(movies), len(tv))
     return movies[:10], tv[:10]
 
 
@@ -882,49 +898,32 @@ def build_message(pick, index, total):
     return {"text": "\n".join(out), "unfurl_links": False, "unfurl_media": False}
 
 
-def build_table_message(movies, tv, today, title_lookup):
-    """Format the US Top 10 Movies + TV as a single Slack reference message."""
+def build_table_message(movies, tv, today):
+    """Format consolidated US Top 10 Movies + TV as a single Slack reference message."""
     date_str = today.strftime("%A, %B %-d")
 
-    def _fmt(entry):
-        fid       = entry["flixpatrol_id"]
+    def _fmt(i, entry):
         name      = entry["title"]
-        us_rank   = entry["us_rank"]
-        rank_last = entry.get("us_rank_last")
+        plat      = entry.get("platform", "")
+        rank      = entry["plat_rank"]
+        rank_last = entry.get("plat_rank_last")
         days      = entry.get("days_total", 0)
 
-        # Movement indicator
         if not rank_last:
-            mv = "new"
-        elif us_rank < rank_last:
-            mv = f"↑{rank_last - us_rank}"
-        elif us_rank > rank_last:
-            mv = f"↓{us_rank - rank_last}"
+            mv = "new entry"
+        elif rank < rank_last:
+            mv = f"↑{rank_last - rank}"
+        elif rank > rank_last:
+            mv = f"↓{rank - rank_last}"
         else:
             mv = "—"
 
-        # Best platform from the merged FlixPatrol data we already hold
-        source = title_lookup.get(fid, {})
-        plat   = ""
-        best_k = (99, 99)
-        for p, types in source.get("top10", {}).items():
-            tier = TIER_MAP.get(p, 5)
-            for ct, data in types.items():
-                r = data.get("ranking") or 99
-                if (tier, r) < best_k:
-                    best_k = (tier, r)
-                    plat   = p
-
-        # Use per-platform days_total when available (more accurate than rankings endpoint)
-        if source.get("days_total"):
-            days = source["days_total"]
-
-        plat_str = f" · {plat}" if plat else ""
+        plat_str = f" · {plat} #{rank}" if plat else f" #{rank}"
         days_str = f" · Day {days}" if days > 0 else ""
-        return f"*{us_rank}.* {name}{plat_str}  {mv}{days_str}"
+        return f"{i}. {name}{plat_str}  {mv}{days_str}"
 
-    movie_lines = [_fmt(e) for e in movies]
-    tv_lines    = [_fmt(e) for e in tv]
+    movie_lines = [_fmt(i + 1, e) for i, e in enumerate(movies)]
+    tv_lines    = [_fmt(i + 1, e) for i, e in enumerate(tv)]
 
     text = "\n".join([
         f"*Top 10 in America — {date_str}*",
@@ -1106,18 +1105,17 @@ def run():
     if posted:
         log_suggestions(svc, posted, today.isoformat())
 
-    # 9. US Top 10 reference tables
-    us_movies, us_tv = fetch_us_top10(yesterday)
-    all_title_map    = {t["flixpatrol_id"]: t for t in all_titles}
+    # 9. US Top 10 reference tables (derived from already-fetched platform data)
+    us_movies, us_tv = derive_us_top10(all_titles)
     if us_movies or us_tv:
         time.sleep(1)
-        table_msg = build_table_message(us_movies, us_tv, today, all_title_map)
+        table_msg = build_table_message(us_movies, us_tv, today)
         if post_slack(table_msg):
             log.info("Posted US Top 10 table (%d movies, %d TV)", len(us_movies), len(us_tv))
         else:
             log.error("Failed to post US Top 10 table")
     else:
-        log.warning("No US Top 10 data returned — skipping table")
+        log.warning("No US Top 10 data — skipping table")
 
 
 if __name__ == "__main__":
