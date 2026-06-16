@@ -646,12 +646,11 @@ SELECTION RULES:
 - Maximum 1 pick per platform — spread across Netflix, HBO Max, Amazon Prime, Disney+, etc.
 - Skip titles in recent_suggestions unless their momentum_score is exceptional (above 12)
 - Prefer titles where mw_performance.talent_signals exists (proven audience for this talent on MovieWeb)
-- When hook_type is talent, set hook_value to: "[Name] | [articles] articles | [over_25k] over 25k sessions | avg [avg_sa] S/A" using the talent_signals data. If no MW data for the talent, just use the name.
+- When hook_type is talent AND the talent appears in mw_performance.talent_signals, set hook_value to: "[Name] | [articles] articles | [over_25k] over 25k sessions | avg [avg_sa] S/A". If the talent has no entry in talent_signals, just use their name — no stats annotation.
 - When no talent signal exists, fall back to franchise/nostalgia/chart hooks using the available data
 
 HEADLINE RULES:
 - site_headline: under 75 characters. Standalone. Frame the story around the hook — do not name the streaming title directly in the headline.
-- smo_title: 85–105 characters, AP Title Case. Add one concrete detail (chart position, years since release, RT score, franchise entry).
 - No vague superlatives. No question headlines. Never use the word "surge" — use "jump", "climb", "spike", or "rise" instead.
 - Never describe a title as a "[platform] movie" or "[platform] show" (e.g. "Netflix movie", "HBO show") — this implies it is a platform original. Say "on Netflix", "streaming on HBO Max", "available on Amazon Prime" instead.
 - Geographic framing is strong: "In America" or "Biggest Movie in America Right Now" when US top 3 on a major platform.
@@ -690,7 +689,6 @@ Select exactly {PICKS_TARGET} picks. Return this JSON:
       "hook_type": "talent|franchise|nostalgia|foreign_language|streaming_event|chart",
       "hook_value": "the specific person, franchise, year, country, or platform+rank",
       "site_headline": "...",
-      "smo_title": "...",
       "angle": "one sentence editorial angle for the article body"
     }}
   ]
