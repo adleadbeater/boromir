@@ -40,7 +40,7 @@ GLOBAL_RANK_FLOOR    = 120
 NEW_ENTRY_RANK_FLOOR = 100
 TITLES_TO_ENRICH     = 30
 PICKS_TARGET         = 6
-SUPPRESS_DAYS        = 0
+SUPPRESS_DAYS        = 2
 
 PLATFORM_IDS = {
     "cmp_IA6TdMqwf6kuyQvxo9bJ4nKX": "Netflix",
@@ -899,10 +899,17 @@ def build_message(pick, index, total):
 
 
 def build_table_message(movies, tv, today):
-    """Format consolidated US Top 10 Movies + TV as a single Slack reference message."""
+    """Format consolidated US Top 10 Movies + TV as a monospace table in Slack."""
     date_str = today.strftime("%A, %B %-d")
 
-    def _fmt(i, entry):
+    W_TITLE = 32
+    W_PLAT  = 17
+    W_MV    = 6
+
+    header = f"{'#':<3}{'Title':<{W_TITLE}}{'Platform':<{W_PLAT}}{'Mv':<{W_MV}}Days"
+    rule   = "─" * (3 + W_TITLE + W_PLAT + W_MV + 4)
+
+    def _row(i, entry):
         name      = entry["title"]
         plat      = entry.get("platform", "")
         rank      = entry["plat_rank"]
@@ -910,7 +917,7 @@ def build_table_message(movies, tv, today):
         days      = entry.get("days_total", 0)
 
         if not rank_last:
-            mv = "new entry"
+            mv = "new"
         elif rank < rank_last:
             mv = f"↑{rank_last - rank}"
         elif rank > rank_last:
@@ -918,23 +925,31 @@ def build_table_message(movies, tv, today):
         else:
             mv = "—"
 
-        plat_str = f" · {plat} #{rank}" if plat else f" #{rank}"
-        days_str = f" · Day {days}" if days > 0 else ""
-        return f"{i}. {name}{plat_str}  {mv}{days_str}"
+        if len(name) > W_TITLE - 1:
+            name = name[:W_TITLE - 2] + "…"
 
-    movie_lines = [_fmt(i + 1, e) for i, e in enumerate(movies)]
-    tv_lines    = [_fmt(i + 1, e) for i, e in enumerate(tv)]
+        plat_str = f"{plat} #{rank}" if plat else f"#{rank}"
+        days_str = str(days) if days > 0 else ""
 
-    text = "\n".join([
-        f"*Top 10 in America — {date_str}*",
+        return f"{i:<3}{name:<{W_TITLE}}{plat_str:<{W_PLAT}}{mv:<{W_MV}}{days_str}"
+
+    movie_rows = [_row(i + 1, e) for i, e in enumerate(movies)]
+    tv_rows    = [_row(i + 1, e) for i, e in enumerate(tv)]
+
+    body = "\n".join([
+        f"Top 10 in America — {date_str}",
         "",
-        "*Movies*",
-        *movie_lines,
+        "MOVIES",
+        header,
+        rule,
+        *movie_rows,
         "",
-        "*TV Shows*",
-        *tv_lines,
+        "TV SHOWS",
+        header,
+        rule,
+        *tv_rows,
     ])
-    return {"text": text, "unfurl_links": False, "unfurl_media": False}
+    return {"text": f"```\n{body}\n```", "unfurl_links": False, "unfurl_media": False}
 
 
 def post_slack(payload):
