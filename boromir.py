@@ -452,9 +452,13 @@ def _ensure_suggestions_tab(svc, sheet_id):
 
 
 def _parse_date(s):
-    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d"):
+    if not s:
+        return None
+    s = s.strip()
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d", "%m/%d/%Y", "%m/%d/%y",
+                "%d/%m/%Y", "%B %d, %Y", "%b %d, %Y"):
         try:
-            return datetime.strptime(s.strip(), fmt).date()
+            return datetime.strptime(s, fmt).date()
         except Exception:
             pass
     return None
@@ -484,6 +488,10 @@ def load_perf_data(svc):
     sheet_id = os.environ["PERF_SHEET_ID"]
     rows     = _read_tab(svc, sheet_id, "DB")
     log.info("Loaded %d performance rows from DB tab", len(rows))
+
+    if rows:
+        log.info("DB tab columns: %s", list(rows[0].keys())[:10])
+        log.info("DB tab first Pub. Date value: %r", rows[0].get("Pub. Date", "NOT FOUND"))
 
     tag_perf        = defaultdict(lambda: {
         "tier1_count": 0, "tier1_heavy": 0, "sessions_t1": 0,
@@ -709,41 +717,67 @@ def build_message(pick, index, total):
     angle     = pick.get("angle", "")
     type_lbl  = "TV" if mt == "tv" else "Movie" if mt == "movie" else ""
 
-    platforms = []
+    # Best platform — lowest tier + lowest rank number
+    best_platform = ""
+    best_ranking  = ""
+    best_key      = (99, 99)
     for platform, types in pick.get("_top10", {}).items():
         tier = TIER_MAP.get(platform, 5)
         if tier > 3:
             continue
         for ct, data in types.items():
-            rank      = data.get("ranking")
-            rank_last = data.get("ranking_last") or 0
-            if not rank_last:
-                arrow = "new"
-            elif rank < rank_last:
-                arrow = "↑"
-            elif rank > rank_last:
-                arrow = "↓"
-            else:
-                arrow = "→"
-            platforms.append((tier, rank or 99, f"{platform} #{rank} {arrow}"))
-    platforms.sort()
-    platform_str = "  |  ".join(p for _, _, p in platforms[:3]) or "trending on streaming"
+            rank = data.get("ranking") or 99
+            if (tier, rank) < best_key:
+                best_key      = (tier, rank)
+                rank_last     = data.get("ranking_last")
+                if not rank_last:
+                    movement  = "new entry"
+                elif rank < rank_last:
+                    movement  = f"up from #{rank_last}"
+                elif rank > rank_last:
+                    movement  = f"down from #{rank_last}"
+                else:
+                    movement  = "unchanged"
+                best_platform = platform
+                best_ranking  = f"#{rank} ({movement})"
+
+    if not best_platform:
+        best_platform = "streaming"
+        best_ranking  = "trending"
+
+    # Trend notes
+    trend_parts = []
+    vc_num = _parse_vc(pick.get("_value_change"))
+    if vc_num is not None:
+        direction = "Up" if vc_num > 0 else "Down"
+        trend_parts.append(f"{direction} {abs(vc_num):.0f}% viewer activity")
+    elif "new entry" in best_ranking:
+        trend_parts.append("New entry")
+    streak = pick.get("_days_streak", 0)
+    if streak and streak > 1:
+        trend_parts.append(f"{streak}-day streak")
+    global_rank = pick.get("_global_rank")
+    if global_rank:
+        trend_parts.append(f"Global rank {global_rank}")
+    trend_str = " | ".join(trend_parts) if trend_parts else "—"
+
+    title_line = f"*{index}/{total}: {name}*" + (f" ({type_lbl})" if type_lbl else "")
 
     out = [
-        f"*{index}/{total}: {name}*" + (f" ({type_lbl})" if type_lbl else ""),
+        title_line,
+        f"Platform: {best_platform}",
+        f"Ranking: {best_ranking}",
+        f"Trend notes: {trend_str}",
         "",
-        f"*{headline}*",
+        f"Suggested hook: {hook_type} — {hook_val}",
+        "",
+        f"Headline: {headline}",
     ]
     if smo and smo != headline:
-        out.append(f"_SMO: {smo}_")
-    out += [
-        "",
-        f"📡  {platform_str}",
-        f"🎯  {hook_type} → {hook_val}",
-    ]
+        out.append(f"SMO: {smo}")
     if angle:
         out += ["", f"_{angle}_"]
-    out += ["", "─" * 60]
+    out += ["", "—" * 52]
 
     return {"text": "\n".join(out), "unfurl_links": False, "unfurl_media": False}
 
@@ -871,11 +905,14 @@ def run():
     picks  = result.get("picks", [])
     log.info("Claude selected %d picks", len(picks))
 
-    # Merge top10 back into picks for Slack formatting
+    # Merge top10 and trend stats back into picks for Slack formatting
     title_map = {t["flixpatrol_id"]: t for t in candidates}
     for pick in picks:
-        source          = title_map.get(pick["flixpatrol_id"], {})
-        pick["_top10"]  = source.get("top10", {})
+        source               = title_map.get(pick["flixpatrol_id"], {})
+        pick["_top10"]       = source.get("top10", {})
+        pick["_global_rank"] = source.get("global_rank")
+        pick["_value_change"] = source.get("value_change")
+        pick["_days_streak"] = source.get("days_streak", 0)
         if not pick.get("media_type"):
             pick["media_type"] = source.get("media_type", "")
 
