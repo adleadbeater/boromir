@@ -490,8 +490,7 @@ def load_perf_data(svc):
     log.info("Loaded %d performance rows from DB tab", len(rows))
 
     if rows:
-        log.info("DB tab columns: %s", list(rows[0].keys())[:10])
-        log.info("DB tab first Pub. Date value: %r", rows[0].get("Pub. Date", "NOT FOUND"))
+        log.info("DB first PubDate value: %r", rows[0].get("PubDate", "NOT FOUND"))
 
     tag_perf        = defaultdict(lambda: {
         "tier1_count": 0, "tier1_heavy": 0, "sessions_t1": 0,
@@ -505,9 +504,9 @@ def load_perf_data(svc):
     today = date.today()
 
     for row in rows:
-        ct       = row.get("Content Type", "").strip()
-        net_cat  = row.get("Net. Cat.", "").strip()
-        pub_date = _parse_date(row.get("Pub. Date", ""))
+        ct       = row.get("ContentType", "").strip()
+        net_cat  = row.get("NetCat", "").strip()
+        pub_date = _parse_date(row.get("PubDate", ""))
         if not pub_date:
             continue
 
@@ -521,17 +520,17 @@ def load_perf_data(svc):
             tier, weight = 3, 0.2
 
         try:
-            sessions = int(str(row.get("Act. Sess.", 0)).replace(",", "").strip())
+            sessions = int(str(row.get("ActSess", 0)).replace(",", "").strip())
         except Exception:
             sessions = 0
 
         is_heavy   = sessions >= SESSIONS_HEAVY
         is_failure = 0 < sessions < SESSIONS_FAILURE
-        title_text = row.get("Title", "").strip()
-        smo_text   = row.get("SMO Title", "").strip()
+        title_text = row.get("ArticleTitle", "").strip()
+        smo_text   = row.get("smoarticletitle", "").strip()
 
         tags = set()
-        pri  = row.get("Pri. Tag", "").strip()
+        pri  = row.get("PriTag", "").strip()
         if pri:
             tags.add(pri.lower())
         for t in row.get("Tags", "").split("|"):
@@ -695,6 +694,12 @@ Select exactly {PICKS_TARGET} picks. Return this JSON:
     raw = response.content[0].text.strip()
     if raw.startswith("```"):
         raw = raw.split("\n", 1)[1].rsplit("```", 1)[0].strip()
+
+    # Extract outermost JSON object in case Claude adds surrounding text
+    start = raw.find("{")
+    end   = raw.rfind("}")
+    if start != -1 and end > start:
+        raw = raw[start:end + 1]
 
     try:
         return json.loads(raw)
