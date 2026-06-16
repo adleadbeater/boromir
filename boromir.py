@@ -648,6 +648,7 @@ SELECTION RULES:
 - Prefer titles where mw_performance.talent_signals exists (proven audience for this talent on MovieWeb)
 - When hook_type is talent AND the talent appears in mw_performance.talent_signals, set hook_value to: "[Name] | [articles] articles | [over_25k] over 25k sessions | avg [avg_sa] S/A". If the talent has no entry in talent_signals, just use their name — no stats annotation.
 - When no talent signal exists, fall back to franchise/nostalgia/chart hooks using the available data
+- Never reference internal data (article counts, session numbers, MW performance metrics, FlixPatrol scores) in the angle or headline — these are editorial signals for selection only. The angle must explain the story for a reader, not justify the pick internally.
 
 HEADLINE RULES:
 - site_headline: under 75 characters. Standalone. Frame the story around the hook — do not name the streaming title directly in the headline.
@@ -847,6 +848,7 @@ def run():
         t for t in all_titles
         if t["momentum_score"] > 0
         and not _PROMO_RE.search(t["title"])
+        and t.get("top10")          # must appear on at least one tracked platform
     ][:TITLES_TO_ENRICH]
     log.info("Scored %d titles, enriching top %d", len(all_titles), len(candidates))
 
