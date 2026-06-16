@@ -652,6 +652,8 @@ SELECTION RULES:
 HEADLINE RULES:
 - site_headline: under 75 characters. Standalone. Frame the story around the hook — do not name the streaming title directly in the headline.
 - No vague superlatives. No question headlines. Never use the word "surge" — use "jump", "climb", "spike", or "rise" instead.
+- Never mention FlixPatrol scores, percentages from the data, article counts, session numbers, or any internal metrics in headlines or titles — ever.
+- Seldom reference these in angles. When you do, translate them into reader-facing terms (e.g. "audiences are responding" not "130% FlixPatrol score").
 - Never describe a title as a "[platform] movie" or "[platform] show" (e.g. "Netflix movie", "HBO show") — this implies it is a platform original. Say "on Netflix", "streaming on HBO Max", "available on Amazon Prime" instead.
 - Geographic framing is strong: "In America" or "Biggest Movie in America Right Now" when US top 3 on a major platform.
 
@@ -757,42 +759,59 @@ def build_message(pick, index, total):
                 best_platform = platform
                 best_ranking  = f"#{rank} ({movement})"
 
-    if not best_platform:
-        best_platform = "streaming"
-        best_ranking  = "trending"
+    # For global-only titles (no tracked US platform), use global rank movement
+    global_rank = pick.get("_global_rank")
+    rank_last   = pick.get("_rank_last")
 
-    # Trend notes — rank movement first, FlixPatrol score second
+    if not best_platform:
+        if global_rank:
+            if not rank_last:
+                best_platform = "Global"
+                best_ranking  = f"#{global_rank} worldwide (new entry)"
+            elif global_rank < rank_last:
+                best_platform = "Global"
+                best_ranking  = f"#{global_rank} worldwide (up from #{rank_last})"
+            elif global_rank > rank_last:
+                best_platform = "Global"
+                best_ranking  = f"#{global_rank} worldwide (down from #{rank_last})"
+            else:
+                best_platform = "Global"
+                best_ranking  = f"#{global_rank} worldwide (unchanged)"
+        else:
+            best_platform = "streaming"
+            best_ranking  = "trending"
+
+    # Trend notes — rank movement only, no FlixPatrol percentages
     trend_parts = []
 
-    # Primary: rank change on best platform
     if "new entry" in best_ranking:
         trend_parts.append(f"New entry at {best_ranking.split(' ')[0]} on {best_platform}")
     elif "up from" in best_ranking:
         old = best_ranking.split("up from ")[-1].rstrip(")")
         cur = best_ranking.split(" ")[0]
-        spots = (int(old.lstrip("#")) - int(cur.lstrip("#")))
-        trend_parts.append(f"Up {spots} spot{'s' if spots != 1 else ''} on {best_platform} (from {old})")
+        try:
+            spots = int(old.lstrip("#")) - int(cur.lstrip("#"))
+            trend_parts.append(f"Up {spots} spot{'s' if spots != 1 else ''} on {best_platform} (from {old})")
+        except ValueError:
+            trend_parts.append(best_ranking)
     elif "down from" in best_ranking:
         old = best_ranking.split("down from ")[-1].rstrip(")")
         cur = best_ranking.split(" ")[0]
-        spots = (int(cur.lstrip("#")) - int(old.lstrip("#")))
-        trend_parts.append(f"Down {spots} spot{'s' if spots != 1 else ''} on {best_platform} (from {old})")
+        try:
+            spots = int(cur.lstrip("#")) - int(old.lstrip("#"))
+            trend_parts.append(f"Down {spots} spot{'s' if spots != 1 else ''} on {best_platform} (from {old})")
+        except ValueError:
+            trend_parts.append(best_ranking)
     else:
         trend_parts.append(f"Holding {best_ranking.split(' ')[0]} on {best_platform}")
 
-    # Secondary: FlixPatrol score change (explains WHY the rank moved)
-    vc_num = _parse_vc(pick.get("_value_change"))
-    if vc_num is not None:
-        sign = "+" if vc_num > 0 else ""
-        trend_parts.append(f"{sign}{vc_num:.0f}% FlixPatrol score")
-
-    # Days in top 10 (use days_total, not streak)
+    # Days in top 10
     days_total = pick.get("_days_total", 0)
     if days_total > 0:
         trend_parts.append(f"Day {days_total} in top 10")
 
-    global_rank = pick.get("_global_rank")
-    if global_rank:
+    # Global rank (only for platform-tracked titles — global-only already show it above)
+    if best_platform != "Global" and global_rank:
         trend_parts.append(f"#{global_rank} globally")
 
     trend_str = " | ".join(trend_parts) if trend_parts else "—"
@@ -955,6 +974,7 @@ def run():
         source               = title_map.get(pick["flixpatrol_id"], {})
         pick["_top10"]        = source.get("top10", {})
         pick["_global_rank"]  = source.get("global_rank")
+        pick["_rank_last"]    = source.get("rank_last")
         pick["_value_change"] = source.get("value_change")
         pick["_days_total"]   = source.get("days_total", 0)
         if not pick.get("media_type"):
