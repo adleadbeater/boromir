@@ -242,6 +242,13 @@ def fetch_flixpatrol(target_date):
         else:
             media_type = "unknown"
 
+        # days_total comes from top10s per-platform data, not the rankings endpoint
+        max_days = max(
+            (data.get("days_total") or 0)
+            for types in top10.values()
+            for data in types.values()
+        ) if top10 else 0
+
         titles.append({
             "flixpatrol_id": tid,
             "title":         r.get("title") or t.get("title") or tid,
@@ -251,8 +258,7 @@ def fetch_flixpatrol(target_date):
             "global_rank":   r.get("global_rank"),
             "rank_last":     r.get("rank_last"),
             "value_change":  r.get("value_change"),
-            "days_streak":   r.get("days_streak", 0),
-            "days_total":    r.get("days_total", 0),
+            "days_total":    max_days,
             "top10":         top10,
         })
 
@@ -284,55 +290,50 @@ def score_momentum(title):
     if not global_rank or global_rank > GLOBAL_RANK_FLOOR:
         return 0.0
 
-    score       = 0.0
-    vc          = _parse_vc(title.get("value_change"))
-    days_streak = title.get("days_streak", 0)
+    score = 0.0
+    vc    = _parse_vc(title.get("value_change"))
 
+    # 1. Value change — keeps signalling large audience shifts
     if vc is not None:
-        if   vc > 100:  score += 3
-        elif vc > 50:   score += 2
-        elif vc > 10:   score += 1
-        elif vc < -50:  score -= 2
-        elif vc < -10:  score -= 1
+        if   vc > 100:  score += 3.0
+        elif vc > 50:   score += 2.0
+        elif vc > 10:   score += 1.0
+        elif vc < -50:  score -= 2.0
+        elif vc < -10:  score -= 1.0
 
+    # 2. Platform rank movement — this is the primary driver
+    max_days = 0
     for platform, types in title.get("top10", {}).items():
-        tier   = TIER_MAP.get(platform, 5)
-        weight = TIER_WEIGHTS.get(tier, 0.5)
+        tier = TIER_MAP.get(platform, 5)
+        tw   = TIER_WEIGHTS.get(tier, 0.5)
 
         for ct, data in types.items():
-            rank = data.get("ranking")
-            if rank is None:
+            rank      = data.get("ranking")
+            rank_last = data.get("ranking_last")
+            days      = data.get("days_total") or 0
+            max_days  = max(max_days, days)
+
+            if rank is None or rank > 10:
                 continue
 
-            rank_score = 3 if rank <= 2 else 2 if rank <= 5 else 1 if rank <= 10 else 0
-            if rank_score == 0 and tier >= 3 and global_rank > 50:
-                continue
-
-            rank_last = data.get("ranking_last") or 0
             if not rank_last:
-                direction = "new"
+                # New entry: biggest story
+                score += tw * 2.0
             elif rank < rank_last:
-                direction = "rising"
+                # Rising: score per spot gained, weighted by platform
+                score += (rank_last - rank) * tw * 0.3
             elif rank > rank_last:
-                direction = "falling"
+                # Dropping: penalty per spot lost
+                score -= (rank - rank_last) * 0.2
             else:
-                direction = "flat"
+                # Stable: small credit, but heavily penalised by staleness below
+                score += tw * 0.25
 
-            new_entry = 0
-            if days_streak <= 3 and global_rank <= NEW_ENTRY_RANK_FLOOR:
-                if tier == 1:
-                    new_entry = 3 if rank <= 5 else 1
-                elif tier == 3:
-                    new_entry = 2 if rank <= 5 else 1
+    # 3. Staleness penalty — been at same spot for too long, less of a story
+    if max_days > 5:
+        score -= (max_days - 5) * 0.2
 
-            fall_penalty = -2 if direction == "falling" and vc and vc < -10 else 0
-            days_on      = data.get("days_total") or 0
-            flat_penalty = -1 if (direction == "flat" and days_on >= 10
-                                  and (vc is None or abs(vc) <= 10)) else 0
-
-            score += (rank_score + new_entry + fall_penalty + flat_penalty) * weight
-
-    return round(score, 2)
+    return round(max(score, 0.0), 2)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -637,6 +638,8 @@ SELECTION RULES:
 - Hook priority: talent > franchise/collection > nostalgia (10+ years old) > foreign language > streaming event > chart position alone
 - Hard exclude: Reality TV, Talk shows, Game shows, Soap operas — check TMDB genres carefully
 - Hard exclude: titles where declining is true (viewer activity dropping more than 15%) — skip these entirely
+- Prefer titles with low days_total (new or recently returning) over titles that have been stable for 10+ days with no rank change — those are stale stories
+- When a title's platform is Pluto or Tubi, frame it as a free streaming story: "available free on Pluto" or "the free streaming hit" — that availability context is part of the hook
 - At least 2 of the 6 picks must be TV shows
 - Maximum 1 pick per platform — spread across Netflix, HBO Max, Amazon Prime, Disney+, etc.
 - Skip titles in recent_suggestions unless their momentum_score is exceptional (above 12)
@@ -757,20 +760,40 @@ def build_message(pick, index, total):
         best_platform = "streaming"
         best_ranking  = "trending"
 
-    # Trend notes
+    # Trend notes — rank movement first, FlixPatrol score second
     trend_parts = []
+
+    # Primary: rank change on best platform
+    if "new entry" in best_ranking:
+        trend_parts.append(f"New entry at {best_ranking.split(' ')[0]} on {best_platform}")
+    elif "up from" in best_ranking:
+        old = best_ranking.split("up from ")[-1].rstrip(")")
+        cur = best_ranking.split(" ")[0]
+        spots = (int(old.lstrip("#")) - int(cur.lstrip("#")))
+        trend_parts.append(f"Up {spots} spot{'s' if spots != 1 else ''} on {best_platform} (from {old})")
+    elif "down from" in best_ranking:
+        old = best_ranking.split("down from ")[-1].rstrip(")")
+        cur = best_ranking.split(" ")[0]
+        spots = (int(cur.lstrip("#")) - int(old.lstrip("#")))
+        trend_parts.append(f"Down {spots} spot{'s' if spots != 1 else ''} on {best_platform} (from {old})")
+    else:
+        trend_parts.append(f"Holding {best_ranking.split(' ')[0]} on {best_platform}")
+
+    # Secondary: FlixPatrol score change (explains WHY the rank moved)
     vc_num = _parse_vc(pick.get("_value_change"))
     if vc_num is not None:
-        direction = "Up" if vc_num > 0 else "Down"
-        trend_parts.append(f"{direction} {abs(vc_num):.0f}% viewer activity")
-    elif "new entry" in best_ranking:
-        trend_parts.append("New entry")
-    streak = pick.get("_days_streak", 0)
-    if streak and streak > 0:
-        trend_parts.append(f"Day {streak} in top 10")
+        sign = "+" if vc_num > 0 else ""
+        trend_parts.append(f"{sign}{vc_num:.0f}% FlixPatrol score")
+
+    # Days in top 10 (use days_total, not streak)
+    days_total = pick.get("_days_total", 0)
+    if days_total > 0:
+        trend_parts.append(f"Day {days_total} in top 10")
+
     global_rank = pick.get("_global_rank")
     if global_rank:
-        trend_parts.append(f"#{global_rank} globally across all streaming")
+        trend_parts.append(f"#{global_rank} globally")
+
     trend_str = " | ".join(trend_parts) if trend_parts else "—"
 
     title_line = f"*{index}/{total}: {name}*" + (f" ({type_lbl})" if type_lbl else "")
@@ -895,6 +918,7 @@ def run():
             "global_rank":    t.get("global_rank"),
             "value_change":   t.get("value_change"),
             "days_streak":    t.get("days_streak", 0),
+            "days_total":     t.get("days_total", 0),
             "declining":      (_parse_vc(t.get("value_change")) or 0) < DECLINING_VC_THRESHOLD,
             "platforms": [
                 {
@@ -930,10 +954,10 @@ def run():
     title_map = {t["flixpatrol_id"]: t for t in candidates}
     for pick in picks:
         source               = title_map.get(pick["flixpatrol_id"], {})
-        pick["_top10"]       = source.get("top10", {})
-        pick["_global_rank"] = source.get("global_rank")
+        pick["_top10"]        = source.get("top10", {})
+        pick["_global_rank"]  = source.get("global_rank")
         pick["_value_change"] = source.get("value_change")
-        pick["_days_streak"] = source.get("days_streak", 0)
+        pick["_days_total"]   = source.get("days_total", 0)
         if not pick.get("media_type"):
             pick["media_type"] = source.get("media_type", "")
 
