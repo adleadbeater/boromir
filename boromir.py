@@ -40,7 +40,7 @@ GLOBAL_RANK_FLOOR    = 120
 NEW_ENTRY_RANK_FLOOR = 100
 TITLES_TO_ENRICH     = 30
 PICKS_TARGET         = 6
-SUPPRESS_DAYS        = 0
+SUPPRESS_DAYS        = 2
 
 PLATFORM_IDS = {
     "cmp_IA6TdMqwf6kuyQvxo9bJ4nKX": "Netflix",
