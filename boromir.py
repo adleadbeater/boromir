@@ -40,7 +40,7 @@ GLOBAL_RANK_FLOOR    = 120
 NEW_ENTRY_RANK_FLOOR = 100
 TITLES_TO_ENRICH     = 30
 PICKS_TARGET         = 6
-SUPPRESS_DAYS        = 2
+SUPPRESS_DAYS        = 0
 
 PLATFORM_IDS = {
     "cmp_IA6TdMqwf6kuyQvxo9bJ4nKX": "Netflix",
@@ -266,6 +266,53 @@ def fetch_flixpatrol(target_date):
 
     log.info("FlixPatrol: %d titles merged", len(titles))
     return titles
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# FLIXPATROL — US TOP 10
+# ─────────────────────────────────────────────────────────────────────────────
+
+def fetch_us_top10(target_date):
+    """Fetch US aggregate rankings; return top-10 movies and top-10 TV shows."""
+    session = _build_session(auth=(os.environ["FLIXPATROL_API_KEY"], ""))
+    log.info("Fetching US rankings for %s", target_date)
+
+    items = fp_get(session, "rankings", {
+        "date[type][eq]": 1,
+        "date[from][eq]": target_date,
+        "date[to][eq]":   target_date,
+        "audience[eq]":   1,
+        "country[in]":    US_COUNTRY,
+    })
+
+    movies, tv = [], []
+    for item in items:
+        d     = item.get("data", item)
+        inner = _inner(d.get("movie", {}))
+        tid   = inner.get("id")
+        if not tid:
+            continue
+        rank = d.get("ranking")
+        if not rank:
+            continue
+        entry = {
+            "flixpatrol_id": tid,
+            "title":         inner.get("title") or tid,
+            "us_rank":       rank,
+            "us_rank_last":  d.get("rankingLast"),
+            "days_total":    d.get("daysTotal") or 0,
+        }
+        ctype = d.get("type")
+        if ctype == 1:
+            movies.append(entry)
+        elif ctype == 2:
+            tv.append(entry)
+
+    movies.sort(key=lambda x: x["us_rank"])
+    tv.sort(key=lambda x: x["us_rank"])
+    log.info("US Top 10: %d movies, %d TV shows fetched",
+             min(len(movies), 10), min(len(tv), 10))
+    return movies[:10], tv[:10]
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -835,6 +882,62 @@ def build_message(pick, index, total):
     return {"text": "\n".join(out), "unfurl_links": False, "unfurl_media": False}
 
 
+def build_table_message(movies, tv, today, title_lookup):
+    """Format the US Top 10 Movies + TV as a single Slack reference message."""
+    date_str = today.strftime("%A, %B %-d")
+
+    def _fmt(entry):
+        fid       = entry["flixpatrol_id"]
+        name      = entry["title"]
+        us_rank   = entry["us_rank"]
+        rank_last = entry.get("us_rank_last")
+        days      = entry.get("days_total", 0)
+
+        # Movement indicator
+        if not rank_last:
+            mv = "new"
+        elif us_rank < rank_last:
+            mv = f"↑{rank_last - us_rank}"
+        elif us_rank > rank_last:
+            mv = f"↓{us_rank - rank_last}"
+        else:
+            mv = "—"
+
+        # Best platform from the merged FlixPatrol data we already hold
+        source = title_lookup.get(fid, {})
+        plat   = ""
+        best_k = (99, 99)
+        for p, types in source.get("top10", {}).items():
+            tier = TIER_MAP.get(p, 5)
+            for ct, data in types.items():
+                r = data.get("ranking") or 99
+                if (tier, r) < best_k:
+                    best_k = (tier, r)
+                    plat   = p
+
+        # Use per-platform days_total when available (more accurate than rankings endpoint)
+        if source.get("days_total"):
+            days = source["days_total"]
+
+        plat_str = f" · {plat}" if plat else ""
+        days_str = f" · Day {days}" if days > 0 else ""
+        return f"*{us_rank}.* {name}{plat_str}  {mv}{days_str}"
+
+    movie_lines = [_fmt(e) for e in movies]
+    tv_lines    = [_fmt(e) for e in tv]
+
+    text = "\n".join([
+        f"*Top 10 in America — {date_str}*",
+        "",
+        "*Movies*",
+        *movie_lines,
+        "",
+        "*TV Shows*",
+        *tv_lines,
+    ])
+    return {"text": text, "unfurl_links": False, "unfurl_media": False}
+
+
 def post_slack(payload):
     resp = requests.post(os.environ["SLACK_WEBHOOK_URL"], json=payload, timeout=15)
     ok   = resp.status_code == 200 and resp.text == "ok"
@@ -1002,6 +1105,19 @@ def run():
     # 8. Log to Suggestions tab
     if posted:
         log_suggestions(svc, posted, today.isoformat())
+
+    # 9. US Top 10 reference tables
+    us_movies, us_tv = fetch_us_top10(yesterday)
+    all_title_map    = {t["flixpatrol_id"]: t for t in all_titles}
+    if us_movies or us_tv:
+        time.sleep(1)
+        table_msg = build_table_message(us_movies, us_tv, today, all_title_map)
+        if post_slack(table_msg):
+            log.info("Posted US Top 10 table (%d movies, %d TV)", len(us_movies), len(us_tv))
+        else:
+            log.error("Failed to post US Top 10 table")
+    else:
+        log.warning("No US Top 10 data returned — skipping table")
 
 
 if __name__ == "__main__":
