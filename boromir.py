@@ -70,7 +70,9 @@ PUBLISHED_SUPPRESS_DAYS = 5
 DECLINING_VC_THRESHOLD  = -15   # exclude titles dropping more than 15% viewer activity
 
 _PROMO_RE = re.compile(
-    r'\b(special look|official look|first look|sneak peek|trailer|teaser|featurette|extended cut preview)\b',
+    r'\b(special look|official look|first look|sneak peek|trailer|teaser|featurette|extended cut preview'
+    r'|special edition|anniversary special|\d+ years and beyond'
+    r'|a special edition of 20\/20|episode of 20\/20)\b',
     re.IGNORECASE,
 )
 
@@ -650,7 +652,8 @@ SELECTION RULES:
 HEADLINE RULES:
 - site_headline: under 75 characters. Standalone. Frame the story around the hook — do not name the streaming title directly in the headline.
 - smo_title: 85–105 characters, AP Title Case. Add one concrete detail (chart position, years since release, RT score, franchise entry).
-- No vague superlatives. No question headlines.
+- No vague superlatives. No question headlines. Never use the word "surge" — use "jump", "climb", "spike", or "rise" instead.
+- Never describe a title as a "[platform] movie" or "[platform] show" (e.g. "Netflix movie", "HBO show") — this implies it is a platform original. Say "on Netflix", "streaming on HBO Max", "available on Amazon Prime" instead.
 - Geographic framing is strong: "In America" or "Biggest Movie in America Right Now" when US top 3 on a major platform.
 
 Good headline examples by hook type:
@@ -808,8 +811,6 @@ def build_message(pick, index, total):
         "",
         f"Headline: {headline}",
     ]
-    if smo and smo != headline:
-        out.append(f"SMO: {smo}")
     if angle:
         out += ["", f"_{angle}_"]
     out += ["", "—" * 52]
