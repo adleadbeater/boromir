@@ -40,7 +40,7 @@ GLOBAL_RANK_FLOOR    = 120
 NEW_ENTRY_RANK_FLOOR = 100
 TITLES_TO_ENRICH     = 30
 PICKS_TARGET         = 6
-SUPPRESS_DAYS        = 2
+SUPPRESS_DAYS        = 0
 
 PLATFORM_IDS = {
     "cmp_IA6TdMqwf6kuyQvxo9bJ4nKX": "Netflix",
@@ -67,6 +67,12 @@ SESSIONS_FAILURE        = 500
 HEADLINE_TIER1_MIN      = 3
 HEADLINE_WEIGHTED_MIN   = 3.0
 PUBLISHED_SUPPRESS_DAYS = 5
+DECLINING_VC_THRESHOLD  = -15   # exclude titles dropping more than 15% viewer activity
+
+_PROMO_RE = re.compile(
+    r'\b(special look|official look|first look|sneak peek|trailer|teaser|featurette|extended cut preview)\b',
+    re.IGNORECASE,
+)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -489,16 +495,13 @@ def load_perf_data(svc):
     rows     = _read_tab(svc, sheet_id, "DB")
     log.info("Loaded %d performance rows from DB tab", len(rows))
 
-    if rows:
-        log.info("DB first PubDate value: %r", rows[0].get("PubDate", "NOT FOUND"))
-
     tag_perf        = defaultdict(lambda: {
         "tier1_count": 0, "tier1_heavy": 0, "sessions_t1": 0,
         "weighted_score": 0.0, "failure_count": 0, "sample_titles": [],
     })
     headline_talent = defaultdict(lambda: {
         "tier1_count": 0, "weighted_score": 0.0,
-        "heavy_count": 0, "is_signal": False,
+        "heavy_count": 0, "sessions_t1": 0, "is_signal": False,
     })
     published_suppress = set()
     today = date.today()
@@ -567,6 +570,7 @@ def load_perf_data(svc):
                 d["weighted_score"] += weight
                 if tier == 1:
                     d["tier1_count"] += 1
+                    d["sessions_t1"] += sessions
                     if is_heavy:
                         d["heavy_count"] += 1
 
@@ -632,10 +636,13 @@ Your task: review today's trending streaming titles and select exactly 6 for our
 SELECTION RULES:
 - Hook priority: talent > franchise/collection > nostalgia (10+ years old) > foreign language > streaming event > chart position alone
 - Hard exclude: Reality TV, Talk shows, Game shows, Soap operas — check TMDB genres carefully
+- Hard exclude: titles where declining is true (viewer activity dropping more than 15%) — skip these entirely
 - At least 2 of the 6 picks must be TV shows
+- Maximum 1 pick per platform — spread across Netflix, HBO Max, Amazon Prime, Disney+, etc.
 - Skip titles in recent_suggestions unless their momentum_score is exceptional (above 12)
-- Prefer titles where mw_performance shows proven history (tier1_heavy > 0 or strong talent_signals)
-- A "heavy hitter" means a past article on this title/talent drove 25,000+ sessions on MovieWeb
+- Prefer titles where mw_performance.talent_signals exists (proven audience for this talent on MovieWeb)
+- When hook_type is talent, set hook_value to: "[Name] | [articles] articles | [over_25k] over 25k sessions | avg [avg_sa] S/A" using the talent_signals data. If no MW data for the talent, just use the name.
+- When no talent signal exists, fall back to franchise/nostalgia/chart hooks using the available data
 
 HEADLINE RULES:
 - site_headline: under 75 characters. Standalone. Frame the story around the hook — do not name the streaming title directly in the headline.
@@ -759,11 +766,11 @@ def build_message(pick, index, total):
     elif "new entry" in best_ranking:
         trend_parts.append("New entry")
     streak = pick.get("_days_streak", 0)
-    if streak and streak > 1:
-        trend_parts.append(f"{streak}-day streak")
+    if streak and streak > 0:
+        trend_parts.append(f"Day {streak} in top 10")
     global_rank = pick.get("_global_rank")
     if global_rank:
-        trend_parts.append(f"Global rank {global_rank}")
+        trend_parts.append(f"#{global_rank} globally across all streaming")
     trend_str = " | ".join(trend_parts) if trend_parts else "—"
 
     title_line = f"*{index}/{total}: {name}*" + (f" ({type_lbl})" if type_lbl else "")
@@ -814,7 +821,11 @@ def run():
     for t in all_titles:
         t["momentum_score"] = score_momentum(t)
     all_titles.sort(key=lambda x: x["momentum_score"], reverse=True)
-    candidates = [t for t in all_titles if t["momentum_score"] > 0][:TITLES_TO_ENRICH]
+    candidates = [
+        t for t in all_titles
+        if t["momentum_score"] > 0
+        and not _PROMO_RE.search(t["title"])
+    ][:TITLES_TO_ENRICH]
     log.info("Scored %d titles, enriching top %d", len(all_titles), len(candidates))
 
     # 3. TMDB enrichment
@@ -837,10 +848,11 @@ def run():
         sig        = {}
         norm_title = t["title"].strip().lower()
         ts         = tag_perf.get(norm_title, {})
-        if ts.get("tier1_heavy", 0) > 0:
-            sig["title_heavy_hitters"] = ts["tier1_heavy"]
         if ts.get("tier1_count", 0) > 0:
-            sig["title_tier1_articles"] = ts["tier1_count"]
+            sig["title_articles"]  = ts["tier1_count"]
+            sig["title_over_25k"]  = ts.get("tier1_heavy", 0)
+            avg = int(ts["sessions_t1"] / ts["tier1_count"]) if ts["tier1_count"] else 0
+            sig["title_avg_sa"]    = avg
 
         talent_hits = []
         all_talent  = (
@@ -851,10 +863,13 @@ def run():
         for person in all_talent:
             ht = headline_talent.get(person.strip().lower(), {})
             if ht.get("is_signal"):
+                articles = ht["tier1_count"]
+                avg_sa   = int(ht["sessions_t1"] / articles) if articles else 0
                 talent_hits.append({
-                    "name":   person,
-                    "tier1":  ht["tier1_count"],
-                    "heavy":  ht["heavy_count"],
+                    "name":      person,
+                    "articles":  articles,
+                    "over_25k":  ht["heavy_count"],
+                    "avg_sa":    avg_sa,
                 })
         if talent_hits:
             sig["talent_signals"] = talent_hits
@@ -880,6 +895,7 @@ def run():
             "global_rank":    t.get("global_rank"),
             "value_change":   t.get("value_change"),
             "days_streak":    t.get("days_streak", 0),
+            "declining":      (_parse_vc(t.get("value_change")) or 0) < DECLINING_VC_THRESHOLD,
             "platforms": [
                 {
                     "platform":     p,
