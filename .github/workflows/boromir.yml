@@ -1,0 +1,31 @@
+name: Boromir Daily Run
+
+on:
+  schedule:
+    - cron: "0 13 * * *"   # 8am ET (1pm UTC)
+  workflow_dispatch:         # manual trigger from GitHub Actions tab
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run Boromir
+        env:
+          FLIXPATROL_API_KEY: ${{ secrets.FLIXPATROL_API_KEY }}
+          TMDB_API_KEY: ${{ secrets.TMDB_API_KEY }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
+          PERF_SHEET_ID: ${{ secrets.PERF_SHEET_ID }}
+        run: python boromir.py
