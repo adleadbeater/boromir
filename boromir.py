@@ -351,8 +351,8 @@ def _parse_vc(vc):
 
 
 def score_momentum(title):
-    global_rank = title.get("global_rank")
-    if not global_rank or global_rank > GLOBAL_RANK_FLOOR:
+    # Only score titles with US platform data
+    if not title.get("top10"):
         return 0.0
 
     score = 0.0
@@ -707,7 +707,7 @@ SELECTION RULES:
 - When a title's platform is Pluto or Tubi, frame it as a free streaming story: "available free on Pluto" or "the free streaming hit" — that availability context is part of the hook
 - At least 2 of the 6 picks must be TV shows
 - Maximum 1 pick per platform — spread across Netflix, HBO Max, Amazon Prime, Disney+, etc.
-- Maximum 1 pick where platforms is empty (global-only titles with no US chart data) — these should only be included when the global movement is exceptional and no stronger US-platform pick is available
+- All picks must have US platform data (platforms will never be empty)
 - Skip titles in recent_suggestions unless their momentum_score is exceptional (above 12)
 - Prefer titles where mw_performance.talent_signals exists (proven audience for this talent on MovieWeb)
 - When hook_type is talent AND the talent appears in mw_performance.talent_signals, set hook_value to: "[Name] | [articles] articles | [over_25k] over 25k sessions | avg [avg_sa] S/A". If the talent has no entry in talent_signals, just use their name — no stats annotation.
@@ -823,27 +823,7 @@ def build_message(pick, index, total):
                 best_platform = platform
                 best_ranking  = f"#{rank} ({movement})"
 
-    # For global-only titles (no tracked US platform), use global rank movement
     global_rank = pick.get("_global_rank")
-    rank_last   = pick.get("_rank_last")
-
-    if not best_platform:
-        if global_rank:
-            if not rank_last:
-                best_platform = "Global"
-                best_ranking  = f"#{global_rank} worldwide (new entry)"
-            elif global_rank < rank_last:
-                best_platform = "Global"
-                best_ranking  = f"#{global_rank} worldwide (up from #{rank_last})"
-            elif global_rank > rank_last:
-                best_platform = "Global"
-                best_ranking  = f"#{global_rank} worldwide (down from #{rank_last})"
-            else:
-                best_platform = "Global"
-                best_ranking  = f"#{global_rank} worldwide (unchanged)"
-        else:
-            best_platform = "streaming"
-            best_ranking  = "trending"
 
     # Trend notes — rank movement only, no FlixPatrol percentages
     trend_parts = []
@@ -874,8 +854,7 @@ def build_message(pick, index, total):
     if days_total > 0:
         trend_parts.append(f"Day {days_total} in top 10")
 
-    # Global rank (only for platform-tracked titles — global-only already show it above)
-    if best_platform != "Global" and global_rank:
+    if global_rank:
         trend_parts.append(f"#{global_rank} globally")
 
     trend_str = " | ".join(trend_parts) if trend_parts else "—"
@@ -984,8 +963,6 @@ def run():
         t for t in all_titles
         if t["momentum_score"] > 0
         and not _PROMO_RE.search(t["title"])
-        # Global-only titles (no US platform data) must be top 25 to be worth covering
-        and (t.get("top10") or (t.get("global_rank") or 999) <= 25)
     ][:TITLES_TO_ENRICH]
     log.info("Scored %d titles, enriching top %d", len(all_titles), len(candidates))
 
