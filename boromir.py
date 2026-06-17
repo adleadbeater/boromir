@@ -707,6 +707,7 @@ SELECTION RULES:
 - When a title's platform is Pluto or Tubi, frame it as a free streaming story: "available free on Pluto" or "the free streaming hit" — that availability context is part of the hook
 - At least 2 of the 6 picks must be TV shows
 - Maximum 1 pick per platform — spread across Netflix, HBO Max, Amazon Prime, Disney+, etc.
+- Maximum 1 pick where platforms is empty (global-only titles with no US chart data) — these should only be included when the global movement is exceptional and no stronger US-platform pick is available
 - Skip titles in recent_suggestions unless their momentum_score is exceptional (above 12)
 - Prefer titles where mw_performance.talent_signals exists (proven audience for this talent on MovieWeb)
 - When hook_type is talent AND the talent appears in mw_performance.talent_signals, set hook_value to: "[Name] | [articles] articles | [over_25k] over 25k sessions | avg [avg_sa] S/A". If the talent has no entry in talent_signals, just use their name — no stats annotation.
@@ -983,6 +984,8 @@ def run():
         t for t in all_titles
         if t["momentum_score"] > 0
         and not _PROMO_RE.search(t["title"])
+        # Global-only titles (no US platform data) must be top 25 to be worth covering
+        and (t.get("top10") or (t.get("global_rank") or 999) <= 25)
     ][:TITLES_TO_ENRICH]
     log.info("Scored %d titles, enriching top %d", len(all_titles), len(candidates))
 
