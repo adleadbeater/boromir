@@ -1,9 +1,7 @@
 name: Boromir Daily Run
 
 on:
-  schedule:
-    - cron: "0 13 * * *"   # 8am ET (1pm UTC)
-  workflow_dispatch:         # manual trigger from GitHub Actions tab
+  workflow_dispatch:         # triggered by cron-job.org at 8am ET
 
 jobs:
   run:
@@ -28,4 +26,6 @@ jobs:
           SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
           GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
           PERF_SHEET_ID: ${{ secrets.PERF_SHEET_ID }}
+          SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
+          SLACK_CHANNEL: ${{ secrets.SLACK_CHANNEL }}
         run: python boromir.py
