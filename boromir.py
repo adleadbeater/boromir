@@ -11,6 +11,10 @@ Required env vars:
     SLACK_WEBHOOK_URL
     GOOGLE_SERVICE_ACCOUNT_JSON
     PERF_SHEET_ID
+
+Optional (enables feedback loop):
+    SLACK_BOT_TOKEN   — xoxb-... Bot User OAuth Token (reactions:read, channels/groups history)
+    SLACK_CHANNEL     — channel name or ID Boromir posts to (e.g. agent-boromir)
 """
 
 import json
@@ -518,7 +522,7 @@ def _ensure_suggestions_tab(svc, sheet_id):
         ).execute()
         _append_rows(svc, sheet_id, "Suggestions", [[
             "date_suggested", "title", "flixpatrol_id",
-            "media_type", "hook_type", "hook_value",
+            "media_type", "hook_type", "hook_value", "slack_ts", "slack_channel",
         ]])
         log.info("Created Suggestions tab")
 
@@ -684,11 +688,138 @@ def log_suggestions(svc, picks, today_str):
             p.get("media_type", ""),
             p.get("hook_type", ""),
             p.get("hook_value", ""),
+            p.get("_slack_ts", ""),
+            p.get("_slack_channel", ""),
         ]
         for p in picks
     ]
     _append_rows(svc, sheet_id, "Suggestions", rows)
     log.info("Logged %d picks to Suggestions tab", len(rows))
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SLACK FEEDBACK LOOP
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _ensure_feedback_tab(svc, sheet_id):
+    meta = svc.spreadsheets().get(spreadsheetId=sheet_id).execute()
+    tabs = [s["properties"]["title"] for s in meta.get("sheets", [])]
+    if "Feedback" not in tabs:
+        svc.spreadsheets().batchUpdate(
+            spreadsheetId=sheet_id,
+            body={"requests": [{"addSheet": {"properties": {"title": "Feedback"}}}]},
+        ).execute()
+        _append_rows(svc, sheet_id, "Feedback", [[
+            "date", "title", "flixpatrol_id", "hook_type",
+            "thumbs_up", "thumbs_down", "other_reactions", "thread_notes",
+        ]])
+        log.info("Created Feedback tab")
+
+
+def collect_feedback(svc, bot_token):
+    """Read 👍/👎 reactions and thread replies from yesterday's picks.
+    Requires SLACK_BOT_TOKEN — skipped silently if not set.
+    Returns list of feedback dicts passed to Claude as context.
+    """
+    if not bot_token:
+        log.info("No SLACK_BOT_TOKEN — skipping feedback collection")
+        return []
+
+    sheet_id = os.environ["PERF_SHEET_ID"]
+    try:
+        rows = _read_tab(svc, sheet_id, "Suggestions")
+    except Exception as e:
+        log.warning("Could not read Suggestions for feedback: %s", e)
+        return []
+
+    yesterday       = (date.today() - timedelta(days=1)).isoformat()
+    yesterday_picks = [
+        r for r in rows
+        if r.get("date_suggested", "").startswith(yesterday) and r.get("slack_ts")
+    ]
+
+    if not yesterday_picks:
+        log.info("No Slack timestamps found for yesterday — skipping feedback")
+        return []
+
+    headers  = {"Authorization": f"Bearer {bot_token}"}
+    feedback = []
+
+    for pick in yesterday_picks:
+        ts      = pick["slack_ts"]
+        channel = pick.get("slack_channel") or os.environ.get("SLACK_CHANNEL", "")
+
+        result = {
+            "title":           pick.get("title", ""),
+            "flixpatrol_id":   pick.get("flixpatrol_id", ""),
+            "hook_type":       pick.get("hook_type", ""),
+            "thumbs_up":       0,
+            "thumbs_down":     0,
+            "other_reactions": [],
+            "thread_notes":    [],
+        }
+
+        # Reactions
+        try:
+            r    = requests.get(
+                "https://slack.com/api/reactions.get",
+                headers=headers,
+                params={"channel": channel, "timestamp": ts},
+                timeout=10,
+            )
+            data = r.json()
+            if data.get("ok"):
+                for rxn in data.get("message", {}).get("reactions", []):
+                    name, count = rxn["name"], rxn["count"]
+                    if name in ("+1", "thumbsup"):
+                        result["thumbs_up"] = count
+                    elif name in ("-1", "thumbsdown"):
+                        result["thumbs_down"] = count
+                    else:
+                        result["other_reactions"].append(f":{name}: ×{count}")
+            else:
+                log.warning("reactions.get failed (%s): %s", pick.get("title"), data.get("error"))
+        except Exception as e:
+            log.warning("Reactions fetch error for %s: %s", pick.get("title"), e)
+
+        # Thread replies (skip index 0 — that's the original post)
+        try:
+            r    = requests.get(
+                "https://slack.com/api/conversations.replies",
+                headers=headers,
+                params={"channel": channel, "ts": ts},
+                timeout=10,
+            )
+            data = r.json()
+            if data.get("ok"):
+                for msg in data.get("messages", [])[1:]:
+                    text = msg.get("text", "").strip()
+                    if text:
+                        result["thread_notes"].append(text)
+        except Exception as e:
+            log.warning("Thread fetch error for %s: %s", pick.get("title"), e)
+
+        feedback.append(result)
+        log.info(
+            "Feedback — %s: 👍%d 👎%d, %d thread note(s)",
+            result["title"], result["thumbs_up"], result["thumbs_down"],
+            len(result["thread_notes"]),
+        )
+
+    # Persist to Google Sheets
+    _ensure_feedback_tab(svc, sheet_id)
+    rows = [[
+        yesterday,
+        f["title"], f["flixpatrol_id"], f["hook_type"],
+        f["thumbs_up"], f["thumbs_down"],
+        ", ".join(f["other_reactions"]),
+        " | ".join(f["thread_notes"])[:500],
+    ] for f in feedback]
+    if rows:
+        _append_rows(svc, sheet_id, "Feedback", rows)
+        log.info("Logged feedback for %d picks to Feedback tab", len(rows))
+
+    return feedback
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -731,7 +862,7 @@ Good headline examples by hook type:
 Respond with valid JSON only. No markdown, no explanation outside the JSON."""
 
 
-def ask_claude(payload, recent_suggestions):
+def ask_claude(payload, recent_suggestions, feedback=None):
     client = anthropic.Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
 
     recent_str = (
@@ -739,13 +870,28 @@ def ask_claude(payload, recent_suggestions):
         if recent_suggestions else "none"
     )
 
+    feedback_str = ""
+    if feedback:
+        lines = []
+        for f in feedback:
+            line = f"- {f['title']} ({f['hook_type']}): 👍{f['thumbs_up']} 👎{f['thumbs_down']}"
+            if f["thread_notes"]:
+                notes = "; ".join(f["thread_notes"][:3])
+                line += f" | Editor notes: {notes}"
+            lines.append(line)
+        feedback_str = (
+            "\n\nEditorial feedback on yesterday's picks "
+            "(use to calibrate hook type and platform preferences today):\n"
+            + "\n".join(lines) + "\n"
+        )
+
     user_msg = f"""Today's trending titles, scored by momentum and platform strength:
 
 {json.dumps(payload, ensure_ascii=False, indent=2)}
 
 Titles suggested in the last {SUPPRESS_DAYS} days — skip unless exceptional:
 {recent_str}
-
+{feedback_str}
 Select exactly {PICKS_TARGET} picks. Return this JSON:
 {{
   "picks": [
@@ -933,11 +1079,34 @@ def build_table_message(movies, tv, today):
 
 
 def post_slack(payload):
+    """Post a message to Slack.
+
+    If SLACK_BOT_TOKEN + SLACK_CHANNEL are set, uses chat.postMessage (returns ts + channel
+    so reactions can be read back later).  Falls back to the webhook otherwise.
+    Returns a dict {"ts": ..., "channel": ...} on success, None on failure.
+    """
+    bot_token = os.environ.get("SLACK_BOT_TOKEN")
+    channel   = os.environ.get("SLACK_CHANNEL")
+
+    if bot_token and channel:
+        resp = requests.post(
+            "https://slack.com/api/chat.postMessage",
+            headers={"Authorization": f"Bearer {bot_token}"},
+            json={**payload, "channel": channel},
+            timeout=15,
+        )
+        data = resp.json()
+        if data.get("ok"):
+            return {"ts": data.get("ts"), "channel": data.get("channel")}
+        log.warning("Slack API error: %s", data.get("error", "unknown"))
+        return None
+
+    # Webhook fallback (no ts available)
     resp = requests.post(os.environ["SLACK_WEBHOOK_URL"], json=payload, timeout=15)
     ok   = resp.status_code == 200 and resp.text == "ok"
     if not ok:
-        log.warning("Slack returned %d: %s", resp.status_code, resp.text[:100])
-    return ok
+        log.warning("Slack webhook returned %d: %s", resp.status_code, resp.text[:100])
+    return {"ts": None, "channel": None} if ok else None
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -976,10 +1145,11 @@ def run():
         time.sleep(0.2)
     log.info("TMDB enrichment done")
 
-    # 4. MW performance data + suggestion history
+    # 4. MW performance data + suggestion history + editorial feedback
     svc                                          = _sheets_service()
     tag_perf, headline_talent, published_suppress = load_perf_data(svc)
     recent_suggestions                            = load_suggestions(svc)
+    feedback                                      = collect_feedback(svc, os.environ.get("SLACK_BOT_TOKEN"))
 
     # 5. Build Claude payload — compact, one entry per candidate
     def mw_signals(t):
@@ -1061,7 +1231,7 @@ def run():
         })
 
     # 6. Claude picks + writes headlines
-    result = ask_claude(payload, recent_suggestions)
+    result = ask_claude(payload, recent_suggestions, feedback)
     picks  = result.get("picks", [])
     log.info("Claude selected %d picks", len(picks))
 
@@ -1085,8 +1255,11 @@ def run():
 
     posted = []
     for i, pick in enumerate(picks, 1):
-        msg = build_message(pick, i, len(picks))
-        if post_slack(msg):
+        msg    = build_message(pick, i, len(picks))
+        result = post_slack(msg)
+        if result:
+            pick["_slack_ts"]      = result.get("ts") or ""
+            pick["_slack_channel"] = result.get("channel") or ""
             log.info("  posted %d/%d: %s", i, len(picks), pick["title"])
             posted.append(pick)
         else:
@@ -1105,7 +1278,7 @@ def run():
     if us_movies or us_tv:
         time.sleep(1)
         table_msg = build_table_message(us_movies, us_tv, today)
-        if post_slack(table_msg):
+        if post_slack(table_msg) is not None:
             log.info("Posted US Top 10 table (%d movies, %d TV)", len(us_movies), len(us_tv))
         else:
             log.error("Failed to post US Top 10 table")
