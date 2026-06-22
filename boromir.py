@@ -44,6 +44,7 @@ GLOBAL_RANK_FLOOR    = 120
 NEW_ENTRY_RANK_FLOOR = 100
 TITLES_TO_ENRICH     = 30
 PICKS_TARGET         = 6
+PLATFORM_CAP         = 2   # max picks from the same platform; enforced in code post-Claude
 SUPPRESS_DAYS        = 2
 
 PLATFORM_IDS = {
@@ -834,7 +835,8 @@ SELECTION RULES:
 - Hook priority: talent > franchise/collection > nostalgia (10+ years old) > foreign language > streaming event > chart position alone
 - Hard exclude: Reality TV, Talk shows, Game shows, Soap operas — check TMDB genres carefully
 - Hard exclude: titles where declining is true (viewer activity dropping more than 15%) — skip these entirely
-- Prefer titles with low days_total (new or recently returning) over titles that have been stable for 10+ days with no rank change — those are stale stories
+- Strongly prefer new entries (days_total 1–3) over titles that have been in the top 10 for 7+ days with only minor rank movement — freshness is almost always the stronger story
+- A franchise or major studio title debuting on any tier-1 platform is a bigger editorial story than a week-old title moving one spot, regardless of which platform it is on — do not overweight Netflix just because it has more data
 - When a title's platform is Pluto or Tubi, frame it as a free streaming story: "available free on Pluto" or "the free streaming hit" — that availability context is part of the hook
 - At least 2 of the 6 picks must be TV shows
 - Maximum 1 pick per platform — spread across Netflix, HBO Max, Amazon Prime, Disney+, etc.
@@ -892,7 +894,7 @@ def ask_claude(payload, recent_suggestions, feedback=None):
 Titles suggested in the last {SUPPRESS_DAYS} days — skip unless exceptional:
 {recent_str}
 {feedback_str}
-Select exactly {PICKS_TARGET} picks. Return this JSON:
+Select exactly {PICKS_TARGET + 3} picks ranked by editorial priority — we will enforce platform caps after and keep the best {PICKS_TARGET}. Return this JSON:
 {{
   "picks": [
     {{
@@ -1022,6 +1024,33 @@ def build_message(pick, index, total):
     out += ["", "—" * 52]
 
     return {"text": "\n".join(out), "unfurl_links": False, "unfurl_media": False}
+
+
+def enforce_platform_cap(picks, cap=PLATFORM_CAP):
+    """Drop picks that exceed per-platform cap; keep the highest-momentum ones first.
+    Claude is asked for PICKS_TARGET+3 so we have headroom to still hit PICKS_TARGET.
+    """
+    counts   = defaultdict(int)
+    filtered = []
+    for pick in picks:
+        # Find best platform (same logic as build_message)
+        best_plat = ""
+        best_key  = (99, 99)
+        for p, types in pick.get("_top10", {}).items():
+            tier = TIER_MAP.get(p, 5)
+            for ct, data in types.items():
+                r = data.get("ranking") or 99
+                if (tier, r) < best_key:
+                    best_key  = (tier, r)
+                    best_plat = p
+        if counts[best_plat] < cap:
+            counts[best_plat] += 1
+            filtered.append(pick)
+        else:
+            log.info("Platform cap (%d): dropped %s (%s)", cap, pick["title"], best_plat)
+    result = filtered[:PICKS_TARGET]
+    log.info("Platform cap applied: %d → %d picks", len(picks), len(result))
+    return result
 
 
 def build_table_message(movies, tv, today):
@@ -1246,6 +1275,9 @@ def run():
         pick["_days_total"]   = source.get("days_total", 0)
         if not pick.get("media_type"):
             pick["media_type"] = source.get("media_type", "")
+
+    # Enforce platform cap in code (Claude asked for PICKS_TARGET+3 to give headroom)
+    picks = enforce_platform_cap(picks)
 
     # 7. Post to Slack
     post_slack({
