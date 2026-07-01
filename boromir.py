@@ -23,7 +23,7 @@ import os
 import re
 import time
 from collections import defaultdict
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 
 import anthropic
 import requests
@@ -46,6 +46,7 @@ TITLES_TO_ENRICH     = 30
 PICKS_TARGET         = 6
 PLATFORM_CAP         = 2   # max picks from the same platform; enforced in code post-Claude
 SUPPRESS_DAYS        = 2
+USAGE_TAB            = "Usage"
 
 PLATFORM_IDS = {
     "cmp_IA6TdMqwf6kuyQvxo9bJ4nKX": "Netflix",
@@ -699,6 +700,65 @@ def log_suggestions(svc, picks, today_str):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# CLAUDE USAGE TRACKING
+# ─────────────────────────────────────────────────────────────────────────────
+
+# In-memory buffer for Claude usage records during a single run.
+# Flushed once at end of run() in a single Sheets API call — never one-per-call.
+_USAGE_LOG: list = []
+
+
+def ensure_usage_tab(svc):
+    """Create the Usage tab with a header row if it doesn't exist yet.
+    Returns the tab name so callers don't need to repeat it."""
+    sheet_id = os.environ["PERF_SHEET_ID"]
+    tabs = {s["properties"]["title"]
+            for s in svc.spreadsheets().get(spreadsheetId=sheet_id).execute()["sheets"]}
+    if USAGE_TAB not in tabs:
+        svc.spreadsheets().batchUpdate(
+            spreadsheetId=sheet_id,
+            body={"requests": [{"addSheet": {"properties": {"title": USAGE_TAB}}}]},
+        ).execute()
+        svc.spreadsheets().values().update(
+            spreadsheetId=sheet_id,
+            range=f"{USAGE_TAB}!A1",
+            valueInputOption="RAW",
+            body={"values": [["timestamp", "call_label", "input_tokens", "output_tokens",
+                               "cache_created", "cache_read", "model"]]},
+        ).execute()
+        log.info("Created %s tab", USAGE_TAB)
+    return USAGE_TAB
+
+
+def flush_usage_to_sheet(svc):
+    """Batch-append this run's buffered Claude usage records to the Usage tab.
+    Safe to call with an empty buffer (no-op). Fails open — a Sheets error
+    logs a warning but never stops the pipeline."""
+    if not _USAGE_LOG:
+        return
+    try:
+        tab = ensure_usage_tab(svc)
+        sheet_id = os.environ["PERF_SHEET_ID"]
+        rows = [
+            [r["timestamp"], r["call_label"], r["input_tokens"], r["output_tokens"],
+             r["cache_created"], r["cache_read"], r["model"]]
+            for r in _USAGE_LOG
+        ]
+        svc.spreadsheets().values().append(
+            spreadsheetId=sheet_id,
+            range=f"{tab}!A:G",
+            valueInputOption="RAW",
+            insertDataOption="INSERT_ROWS",
+            body={"values": rows},
+        ).execute()
+        log.info("Flushed %d Claude usage record(s) to %s tab", len(rows), tab)
+        _USAGE_LOG.clear()
+    except Exception as e:
+        # Never let usage-tracking failures block a real run.
+        log.warning("Could not flush Claude usage to sheet: %s", e)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # SLACK FEEDBACK LOOP
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -923,6 +983,15 @@ Select exactly {PICKS_TARGET + 3} picks ranked by editorial priority — we will
         getattr(u, "cache_read_input_tokens", 0),
         getattr(u, "cache_creation_input_tokens", 0),
     )
+    _USAGE_LOG.append({
+        "timestamp":     datetime.now(timezone.utc).isoformat(),
+        "call_label":    "picks",
+        "input_tokens":  u.input_tokens,
+        "output_tokens": u.output_tokens,
+        "cache_created": getattr(u, "cache_creation_input_tokens", 0),
+        "cache_read":    getattr(u, "cache_read_input_tokens", 0),
+        "model":         "claude-sonnet-4-6",
+    })
 
     raw = response.content[0].text.strip()
     if raw.startswith("```"):
@@ -1324,6 +1393,9 @@ def run():
             log.error("Failed to post US Top 10 table")
     else:
         log.warning("No US Top 10 data — skipping table")
+
+    # 10. Flush Claude API usage to the Usage sheet tab
+    flush_usage_to_sheet(svc)
 
 
 if __name__ == "__main__":
