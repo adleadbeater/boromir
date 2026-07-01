@@ -912,8 +912,16 @@ Select exactly {PICKS_TARGET + 3} picks ranked by editorial priority — we will
     response = client.messages.create(
         model="claude-sonnet-4-6",
         max_tokens=4096,
-        system=SYSTEM_PROMPT,
+        system=[{"type": "text", "text": SYSTEM_PROMPT, "cache_control": {"type": "ephemeral"}}],
         messages=[{"role": "user", "content": user_msg}],
+    )
+    u = response.usage
+    log.info(
+        "claude_usage  input=%s  output=%s  cache_read=%s  cache_write=%s",
+        u.input_tokens,
+        u.output_tokens,
+        getattr(u, "cache_read_input_tokens", 0),
+        getattr(u, "cache_creation_input_tokens", 0),
     )
 
     raw = response.content[0].text.strip()
