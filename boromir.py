@@ -47,6 +47,10 @@ PICKS_TARGET         = 6
 PLATFORM_CAP         = 2   # max picks from the same platform; enforced in code post-Claude
 SUPPRESS_DAYS        = 2
 USAGE_TAB            = "Usage"
+TOPTAGS_TAB          = "TopTags"
+TOP_TAGS_COUNT       = 15
+TOP_TAGS_LOOKBACK_DAYS = 365
+TRUE_CRIME_DOC_CAP   = 1   # max true-crime/documentary TV picks; enforced in code post-Claude
 
 PLATFORM_IDS = {
     "cmp_IA6TdMqwf6kuyQvxo9bJ4nKX": "Netflix",
@@ -477,6 +481,19 @@ def fetch_tmdb(session, title):
     }
 
 
+def _tv_content_bucket(tmdb):
+    """Classify a TV title as narrative (scripted drama/comedy/thriller) or
+    true_crime_doc, from TMDB genres + overview. Used to enforce TV diversity —
+    Reality/Talk/Game shows are already hard-excluded upstream in the prompt."""
+    genres   = [g.lower() for g in (tmdb or {}).get("genres", [])]
+    overview = ((tmdb or {}).get("overview") or "").lower()
+    if "documentary" in genres:
+        return "true_crime_doc"
+    if "crime" in genres and "true crime" in overview:
+        return "true_crime_doc"
+    return "narrative"
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # GOOGLE SHEETS
 # ─────────────────────────────────────────────────────────────────────────────
@@ -511,6 +528,28 @@ def _append_rows(svc, sheet_id, tab, rows):
         valueInputOption="RAW",
         insertDataOption="INSERT_ROWS",
         body={"values": rows},
+    ).execute()
+
+
+def _overwrite_tab(svc, sheet_id, tab, all_rows):
+    """Ensure tab exists, clear its contents, and write all_rows (header + data) fresh.
+    Used for snapshot tabs (like TopTags) that represent current state rather than
+    an accumulating log — unlike _append_rows, this replaces everything each call."""
+    meta = svc.spreadsheets().get(spreadsheetId=sheet_id).execute()
+    tabs = [s["properties"]["title"] for s in meta.get("sheets", [])]
+    if tab not in tabs:
+        svc.spreadsheets().batchUpdate(
+            spreadsheetId=sheet_id,
+            body={"requests": [{"addSheet": {"properties": {"title": tab}}}]},
+        ).execute()
+        log.info("Created %s tab", tab)
+    else:
+        svc.spreadsheets().values().clear(
+            spreadsheetId=sheet_id, range=tab, body={},
+        ).execute()
+    svc.spreadsheets().values().update(
+        spreadsheetId=sheet_id, range=f"{tab}!A1",
+        valueInputOption="RAW", body={"values": all_rows},
     ).execute()
 
 
@@ -697,6 +736,175 @@ def log_suggestions(svc, picks, today_str):
     ]
     _append_rows(svc, sheet_id, "Suggestions", rows)
     log.info("Logged %d picks to Suggestions tab", len(rows))
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# REPEAT OPPORTUNITY — monthly tag scan + daily flag
+# ─────────────────────────────────────────────────────────────────────────────
+
+def compute_top_tags(svc, top_n=TOP_TAGS_COUNT, lookback_days=TOP_TAGS_LOOKBACK_DAYS):
+    """Monthly job: rank Niche News tags by MW performance over the trailing year,
+    and record each tag's single best-performing headline (exact text) for reuse
+    when the tag resurfaces. Overwrites the TopTags tab — a current snapshot, not
+    an accumulating log, since only the latest ranking is useful for matching."""
+    sheet_id = os.environ["PERF_SHEET_ID"]
+    rows     = _read_tab(svc, sheet_id, "DB")
+    cutoff   = date.today() - timedelta(days=lookback_days)
+
+    tag_stats = defaultdict(lambda: {
+        "weighted_score": 0.0, "tier1_count": 0, "tier1_heavy": 0,
+        "best_sessions": -1, "best_headline": "", "sample_titles": [],
+    })
+    niche_count = 0
+
+    for row in rows:
+        if row.get("ContentType", "").strip() != "Niche News":
+            continue
+        pub_date = _parse_date(row.get("PubDate", ""))
+        if not pub_date or pub_date < cutoff:
+            continue
+        niche_count += 1
+
+        try:
+            sessions = int(str(row.get("ActSess", 0)).replace(",", "").strip())
+        except Exception:
+            sessions = 0
+        is_heavy   = sessions >= SESSIONS_HEAVY
+        title_text = row.get("ArticleTitle", "").strip()
+
+        tags = set()
+        pri = row.get("PriTag", "").strip()
+        if pri:
+            tags.add(pri.lower())
+        for t in row.get("Tags", "").split("|"):
+            t = t.strip()
+            if t:
+                tags.add(t.lower())
+
+        for tag in tags:
+            d = tag_stats[tag]
+            d["weighted_score"] += 1.0
+            d["tier1_count"]    += 1
+            if is_heavy:
+                d["tier1_heavy"] += 1
+                if len(d["sample_titles"]) < 3:
+                    d["sample_titles"].append(title_text)
+            if sessions > d["best_sessions"]:
+                d["best_sessions"] = sessions
+                d["best_headline"] = title_text
+
+    ranked = sorted(
+        tag_stats.items(),
+        key=lambda kv: (kv[1]["tier1_heavy"], kv[1]["weighted_score"]),
+        reverse=True,
+    )[:top_n]
+
+    computed_date = date.today().isoformat()
+    table_rows = [
+        [computed_date, tag, round(d["weighted_score"], 2), d["tier1_count"],
+         d["tier1_heavy"], " | ".join(d["sample_titles"]), d["best_headline"]]
+        for tag, d in ranked
+    ]
+
+    _overwrite_tab(svc, sheet_id, TOPTAGS_TAB, [
+        ["computed_date", "tag", "weighted_score", "tier1_count",
+         "tier1_heavy", "sample_titles", "best_headline"],
+        *table_rows,
+    ])
+    log.info(
+        "TopTags: ranked %d tags from %d Niche News rows (past %d days)",
+        len(ranked), niche_count, lookback_days,
+    )
+    return ranked
+
+
+def load_top_tags(svc):
+    """Read the TopTags tab (written monthly by compute_top_tags) into a lookup dict.
+    Returns {} if the tab doesn't exist yet or is empty — fails open, meaning the
+    daily repeat-opportunity check simply finds nothing until the first monthly run."""
+    sheet_id = os.environ["PERF_SHEET_ID"]
+    try:
+        rows = _read_tab(svc, sheet_id, TOPTAGS_TAB)
+    except Exception as e:
+        log.warning("Could not read %s tab: %s", TOPTAGS_TAB, e)
+        return {}
+    return {
+        r["tag"]: {"best_headline": r.get("best_headline", "")}
+        for r in rows if r.get("tag")
+    }
+
+
+def check_repeat_opportunities(all_titles, candidates, top_tags):
+    """Flag titles anywhere in today's US Top 10 (not just the 6-pick candidate
+    pool) whose title, cast, director, or franchise collection matches a
+    historically top-performing MW tag.
+
+    Cast/director/collection matching only works for titles already TMDB-enriched
+    (the top TITLES_TO_ENRICH momentum-scored candidates) — titles outside that
+    set are matched on their raw title string only.
+    """
+    if not top_tags:
+        return []
+    candidate_tmdb = {t["flixpatrol_id"]: t.get("tmdb", {}) for t in candidates}
+    hits, seen = [], set()
+
+    for t in all_titles:
+        if not t.get("top10"):
+            continue
+        norm_title = t["title"].strip().lower()
+        if norm_title in seen:
+            continue
+
+        match_tag = norm_title if norm_title in top_tags else None
+        if not match_tag:
+            tmdb      = candidate_tmdb.get(t["flixpatrol_id"], {})
+            check_set = {p.strip().lower() for p in (
+                tmdb.get("cast", [])[:5] + tmdb.get("directors", []) + tmdb.get("creators", [])
+            )}
+            if tmdb.get("collection"):
+                check_set.add(tmdb["collection"].strip().lower())
+            overlap = check_set & top_tags.keys()
+            if overlap:
+                match_tag = next(iter(overlap))
+
+        if not match_tag:
+            continue
+
+        best_plat, best_rank, best_key = "", None, (99, 99)
+        for p, types in t["top10"].items():
+            tier = TIER_MAP.get(p, 5)
+            for ct, data in types.items():
+                r = data.get("ranking") or 99
+                if (tier, r) < best_key:
+                    best_key, best_plat, best_rank = (tier, r), p, data.get("ranking")
+
+        seen.add(norm_title)
+        hits.append({
+            "title":         t["title"],
+            "tag":           match_tag,
+            "platform":      best_plat,
+            "rank":          best_rank,
+            "best_headline": top_tags[match_tag].get("best_headline", ""),
+        })
+
+    return hits
+
+
+def build_repeat_opportunity_message(hits, today):
+    """Format repeat-opportunity flags as their own Slack message, clearly
+    separate from Boromir's 6 daily picks."""
+    if not hits:
+        return None
+    date_str = today.strftime("%A, %B %-d")
+    lines = [f"*Repeat Opportunity — {date_str}*  _separate from Boromir's 6 picks_", ""]
+    for h in hits:
+        plat_str = f"{h['platform']} #{h['rank']}" if h["platform"] else "—"
+        lines.append(f"*{h['title']}*  ({plat_str})")
+        lines.append(f"Matched tag: {h['tag']}")
+        if h["best_headline"]:
+            lines.append(f"Reuse framing: “{h['best_headline']}”")
+        lines.append("")
+    return {"text": "\n".join(lines).strip(), "unfurl_links": False, "unfurl_media": False}
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -898,7 +1106,8 @@ SELECTION RULES:
 - Strongly prefer new entries (days_total 1–3) over titles that have been in the top 10 for 7+ days with only minor rank movement — freshness is almost always the stronger story
 - A franchise or major studio title debuting on any tier-1 platform is a bigger editorial story than a week-old title moving one spot, regardless of which platform it is on — do not overweight Netflix just because it has more data
 - When a title's platform is Pluto or Tubi, frame it as a free streaming story: "available free on Pluto" or "the free streaming hit" — that availability context is part of the hook
-- At least 2 of the 6 picks must be TV shows
+- At least 2 of the 6 picks must be TV shows, and at least 2 of the TV picks must be scripted narrative series (drama, comedy, thriller) — not true crime, documentary, or reality
+- Maximum 1 True Crime or Documentary TV pick total (content_bucket: true_crime_doc) — never more than one non-narrative TV pick
 - Maximum 1 pick per platform — spread across Netflix, HBO Max, Amazon Prime, Disney+, etc.
 - All picks must have US platform data (platforms will never be empty)
 - Skip titles in recent_suggestions unless their momentum_score is exceptional (above 12)
@@ -1130,6 +1339,22 @@ def enforce_platform_cap(picks, cap=PLATFORM_CAP):
     return result
 
 
+def enforce_tv_diversity(picks, cap=TRUE_CRIME_DOC_CAP):
+    """Cap true-crime/documentary TV picks at `cap`; keep earlier-ranked picks
+    first (Claude ranks by editorial priority). Runs before enforce_platform_cap
+    so a dropped doc pick doesn't consume a platform slot."""
+    doc_count = 0
+    filtered  = []
+    for pick in picks:
+        if pick.get("media_type") == "tv" and _tv_content_bucket(pick.get("_tmdb", {})) == "true_crime_doc":
+            if doc_count >= cap:
+                log.info("TV diversity cap (%d): dropped %s (true crime/doc)", cap, pick["title"])
+                continue
+            doc_count += 1
+        filtered.append(pick)
+    return filtered
+
+
 def build_table_message(movies, tv, today):
     """Format consolidated US Top 10 Movies + TV as a monospace table in Slack."""
     date_str = today.strftime("%A, %B %-d")
@@ -1311,6 +1536,7 @@ def run():
             "days_streak":    t.get("days_streak", 0),
             "days_total":     t.get("days_total", 0),
             "declining":      (_parse_vc(t.get("value_change")) or 0) < DECLINING_VC_THRESHOLD,
+            "content_bucket": _tv_content_bucket(tmdb) if t.get("media_type") == "tv" else None,
             "platforms": [
                 {
                     "platform":     p,
@@ -1350,10 +1576,13 @@ def run():
         pick["_rank_last"]    = source.get("rank_last")
         pick["_value_change"] = source.get("value_change")
         pick["_days_total"]   = source.get("days_total", 0)
+        pick["_tmdb"]         = source.get("tmdb", {})
         if not pick.get("media_type"):
             pick["media_type"] = source.get("media_type", "")
 
-    # Enforce platform cap in code (Claude asked for PICKS_TARGET+3 to give headroom)
+    # Enforce TV diversity, then platform cap, in code (Claude asked for
+    # PICKS_TARGET+3 to give headroom for both filters)
+    picks = enforce_tv_diversity(picks)
     picks = enforce_platform_cap(picks)
 
     # 7. Post to Slack
@@ -1394,9 +1623,38 @@ def run():
     else:
         log.warning("No US Top 10 data — skipping table")
 
-    # 10. Flush Claude API usage to the Usage sheet tab
+    # 10. Repeat-opportunity check (monthly tag list, checked daily against
+    #     every title in today's US Top 10 — not just the 6-pick candidates)
+    top_tags    = load_top_tags(svc)
+    repeat_hits = check_repeat_opportunities(all_titles, candidates, top_tags)
+    if repeat_hits:
+        time.sleep(1)
+        repeat_msg = build_repeat_opportunity_message(repeat_hits, today)
+        if post_slack(repeat_msg) is not None:
+            log.info("Posted %d repeat-opportunity flag(s)", len(repeat_hits))
+        else:
+            log.error("Failed to post repeat-opportunity message")
+    else:
+        log.info("No repeat-opportunity matches today")
+
+    # 11. Flush Claude API usage to the Usage sheet tab
     flush_usage_to_sheet(svc)
 
 
+def run_monthly_tags():
+    """Monthly job: recompute the TopTags tab from the trailing year of Niche
+    News performance. Sheets-only — no FlixPatrol/TMDB/Anthropic/Slack calls."""
+    today = date.today()
+    log.info("=" * 52)
+    log.info("  BOROMIR — Monthly Top Tags scan  |  %s", today.isoformat())
+    log.info("=" * 52)
+    svc = _sheets_service()
+    compute_top_tags(svc)
+
+
 if __name__ == "__main__":
-    run()
+    import sys
+    if "--monthly-tags" in sys.argv:
+        run_monthly_tags()
+    else:
+        run()
