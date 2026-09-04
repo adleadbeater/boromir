@@ -48,7 +48,7 @@ PLATFORM_CAP         = 2   # max picks from the same platform; enforced in code 
 SUPPRESS_DAYS        = 2
 USAGE_TAB            = "Usage"
 TOPTAGS_TAB          = "TopTitles"
-TOP_TAGS_COUNT       = 15
+TOP_TITLES_MIN_HEAVY = 1   # qualifies as a "good performer" if it has >=1 heavy-session (SESSIONS_HEAVY) hit — no arbitrary top-N cap
 TOP_TAGS_LOOKBACK_DAYS = 365
 TRUE_CRIME_DOC_CAP   = 1   # max true-crime/documentary TV picks; enforced in code post-Claude
 
@@ -797,11 +797,13 @@ def _row_title(row, mentioned_people=frozenset()):
     return ""
 
 
-def compute_top_tags(svc, top_n=TOP_TAGS_COUNT, lookback_days=TOP_TAGS_LOOKBACK_DAYS):
-    """Monthly job: rank specific movie/show titles by MW performance over the
+def compute_top_tags(svc, min_heavy=TOP_TITLES_MIN_HEAVY, lookback_days=TOP_TAGS_LOOKBACK_DAYS):
+    """Monthly job: rank every specific movie/show title that qualifies as a
+    good performer (>=min_heavy heavy-session hits) by MW performance over the
     trailing year, and record each title's single best-performing headline
-    (exact text) for reuse when it resurfaces. Overwrites the TopTitles tab —
-    a current snapshot, not an accumulating log, since only the latest ranking
+    (exact text) for reuse when it resurfaces. No arbitrary top-N cap — every
+    title clearing the bar is included. Overwrites the TopTitles tab — a
+    current snapshot, not an accumulating log, since only the latest ranking
     is useful for matching."""
     sheet_id = os.environ["PERF_SHEET_ID"]
     rows     = _read_tab(svc, sheet_id, "DB")
@@ -847,10 +849,10 @@ def compute_top_tags(svc, top_n=TOP_TAGS_COUNT, lookback_days=TOP_TAGS_LOOKBACK_
             d["best_headline"] = article_txt
 
     ranked = sorted(
-        title_stats.items(),
+        (item for item in title_stats.items() if item[1]["tier1_heavy"] >= min_heavy),
         key=lambda kv: (kv[1]["tier1_heavy"], kv[1]["weighted_score"]),
         reverse=True,
-    )[:top_n]
+    )
 
     computed_date = date.today().isoformat()
     table_rows = [
@@ -865,8 +867,9 @@ def compute_top_tags(svc, top_n=TOP_TAGS_COUNT, lookback_days=TOP_TAGS_LOOKBACK_
         *table_rows,
     ])
     log.info(
-        "TopTitles: ranked %d titles from %d Niche News rows (past %d days, %d skipped — no recoverable title)",
-        len(ranked), niche_count, lookback_days, skipped_name,
+        "TopTitles: %d titles cleared the >=%d heavy-hit bar, from %d Niche News rows "
+        "(past %d days, %d skipped — no recoverable title)",
+        len(ranked), min_heavy, niche_count, lookback_days, skipped_name,
     )
     return ranked
 
