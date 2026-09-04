@@ -757,21 +757,42 @@ def log_suggestions(svc, picks, today_str):
 # REPEAT OPPORTUNITY — monthly tag scan + daily flag
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _row_title(row):
-    """Best-effort resolve which specific movie/show a DB row is about.
-    PriTag is usually the subject, but sometimes holds the platform or a
-    person's name instead (e.g. PriTag="Prime Video" with the actual title
-    buried in Tags) — in that case fall back to the first non-generic Tags
-    entry. Not perfect: a row whose PriTag is a person's name (e.g. "Taylor
-    Sheridan") with no clearer Tags entry will still resolve to that name
-    rather than a title — there's no dedicated title column in this sheet
-    to disambiguate further."""
+def _mentioned_names(rows):
+    """Extract person names from historical headline text, using the same
+    pattern already used for talent-performance tracking (see load_perf_data's
+    headline_talent extraction). Used to exclude actor/director mentions from
+    the title ranking below, since PriTag/Tags don't reliably distinguish a
+    person's name from a movie/show title."""
+    names = set()
+    for row in rows:
+        for text in (row.get("ArticleTitle", ""), row.get("smoarticletitle", "")):
+            for match in _NAME_RE.findall(text):
+                if any(w.lower() in _STOP_WORDS for w in match.split()):
+                    continue
+                names.add(match.strip().lower())
+    return names
+
+
+def _row_title(row, mentioned_people=frozenset()):
+    """Best-effort resolve which specific movie/show a DB row is about,
+    excluding platforms/genres (NON_TITLE_TAGS) and talent names
+    (mentioned_people). PriTag is usually the subject, but sometimes holds
+    the platform or a person's name instead — in that case fall back to the
+    first valid Tags entry. There's no dedicated title column in this sheet:
+    a row whose only tag is a talent name with no other identifiable title
+    (e.g. PriTag="Jason Statham", Tags="Action|Thriller") has no recoverable
+    title and is skipped entirely — better to drop it than mislabel a person
+    as a movie."""
+    def _valid(v):
+        vl = v.strip().lower()
+        return bool(vl) and vl not in NON_TITLE_TAGS and vl not in mentioned_people
+
     pri = row.get("PriTag", "").strip()
-    if pri and pri.lower() not in NON_TITLE_TAGS:
+    if _valid(pri):
         return pri
     for t in row.get("Tags", "").split("|"):
         t = t.strip()
-        if t and t.lower() not in NON_TITLE_TAGS:
+        if _valid(t):
             return t
     return ""
 
@@ -785,12 +806,14 @@ def compute_top_tags(svc, top_n=TOP_TAGS_COUNT, lookback_days=TOP_TAGS_LOOKBACK_
     sheet_id = os.environ["PERF_SHEET_ID"]
     rows     = _read_tab(svc, sheet_id, "DB")
     cutoff   = date.today() - timedelta(days=lookback_days)
+    mentioned_people = _mentioned_names(rows)
 
     title_stats = defaultdict(lambda: {
         "weighted_score": 0.0, "tier1_count": 0, "tier1_heavy": 0,
         "best_sessions": -1, "best_headline": "", "sample_titles": [],
     })
-    niche_count = 0
+    niche_count  = 0
+    skipped_name = 0
 
     for row in rows:
         if row.get("ContentType", "").strip() != "Niche News":
@@ -800,8 +823,9 @@ def compute_top_tags(svc, top_n=TOP_TAGS_COUNT, lookback_days=TOP_TAGS_LOOKBACK_
             continue
         niche_count += 1
 
-        title = _row_title(row)
+        title = _row_title(row, mentioned_people)
         if not title:
+            skipped_name += 1
             continue
 
         try:
@@ -841,8 +865,8 @@ def compute_top_tags(svc, top_n=TOP_TAGS_COUNT, lookback_days=TOP_TAGS_LOOKBACK_
         *table_rows,
     ])
     log.info(
-        "TopTitles: ranked %d titles from %d Niche News rows (past %d days)",
-        len(ranked), niche_count, lookback_days,
+        "TopTitles: ranked %d titles from %d Niche News rows (past %d days, %d skipped — no recoverable title)",
+        len(ranked), niche_count, lookback_days, skipped_name,
     )
     return ranked
 
