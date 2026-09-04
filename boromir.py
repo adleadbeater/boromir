@@ -968,7 +968,7 @@ def load_top_tags(svc):
     }
 
 
-def check_repeat_opportunities(all_titles, candidates, top_tags, http_session):
+def check_repeat_opportunities(all_titles, candidates, top_tags):
     """Flag titles anywhere in today's US Top 10 (not just the 6-pick candidate
     pool) whose title, cast, director, or franchise collection matches a
     historically top-performing MW title (from compute_top_tags).
@@ -976,12 +976,6 @@ def check_repeat_opportunities(all_titles, candidates, top_tags, http_session):
     Cast/director/collection matching only works for titles already TMDB-enriched
     (the top TITLES_TO_ENRICH momentum-scored candidates) — titles outside that
     set are matched on their raw title string only.
-
-    For each match, resolves a plain descriptive overview of the show (TMDB
-    enrichment already exists for candidates; fetched fresh for the small
-    number of non-candidate matches) rather than reusing MW's own headline
-    text — editors asked for a neutral description + the original article
-    link, not a repurposed headline.
     """
     if not top_tags:
         return []
@@ -1018,17 +1012,13 @@ def check_repeat_opportunities(all_titles, candidates, top_tags, http_session):
                 if (tier, r) < best_key:
                     best_key, best_plat, best_rank = (tier, r), p, data.get("ranking")
 
-        tmdb = candidate_tmdb.get(t["flixpatrol_id"])
-        if tmdb is None:
-            tmdb = fetch_tmdb(http_session, t)
-
         seen.add(norm_title)
         hits.append({
             "title":         t["title"],
             "tag":           match_tag,
             "platform":      best_plat,
             "rank":          best_rank,
-            "overview":      tmdb.get("overview", ""),
+            "best_headline": top_tags[match_tag].get("best_headline", ""),
             "best_url":      top_tags[match_tag].get("best_url", ""),
         })
 
@@ -1037,9 +1027,8 @@ def check_repeat_opportunities(all_titles, candidates, top_tags, http_session):
 
 def build_repeat_opportunity_message(hits, today):
     """Format repeat-opportunity flags as their own Slack message, clearly
-    separate from Boromir's 6 daily picks. Shows a plain description of the
-    show plus a link to the original MW article (so editors can see the
-    image) rather than reusing MW's own headline text."""
+    separate from Boromir's 6 daily picks. Shows the exact headline that
+    performed well before, plus a link to that original MW article."""
     if not hits:
         return None
     date_str = today.strftime("%A, %B %-d")
@@ -1047,10 +1036,10 @@ def build_repeat_opportunity_message(hits, today):
     for h in hits:
         plat_str = f"{h['platform']} #{h['rank']}" if h["platform"] else "—"
         lines.append(f"*{h['title']}*  ({plat_str})")
-        if h["overview"]:
-            lines.append(h["overview"][:280])
+        if h["best_headline"]:
+            lines.append(f"“{h['best_headline']}”")
         if h["best_url"]:
-            lines.append(f"Article: {h['best_url']}")
+            lines.append(f"Previous article: {h['best_url']}")
         lines.append("")
     return {"text": "\n".join(lines).strip(), "unfurl_links": True, "unfurl_media": True}
 
@@ -1774,7 +1763,7 @@ def run():
     # 10. Repeat-opportunity check (monthly tag list, checked daily against
     #     every title in today's US Top 10 — not just the 6-pick candidates)
     top_tags    = load_top_tags(svc)
-    repeat_hits = check_repeat_opportunities(all_titles, candidates, top_tags, http)
+    repeat_hits = check_repeat_opportunities(all_titles, candidates, top_tags)
     if repeat_hits:
         time.sleep(1)
         repeat_msg = build_repeat_opportunity_message(repeat_hits, today)
