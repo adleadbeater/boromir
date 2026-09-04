@@ -47,10 +47,25 @@ PICKS_TARGET         = 6
 PLATFORM_CAP         = 2   # max picks from the same platform; enforced in code post-Claude
 SUPPRESS_DAYS        = 2
 USAGE_TAB            = "Usage"
-TOPTAGS_TAB          = "TopTags"
+TOPTAGS_TAB          = "TopTitles"
 TOP_TAGS_COUNT       = 15
 TOP_TAGS_LOOKBACK_DAYS = 365
 TRUE_CRIME_DOC_CAP   = 1   # max true-crime/documentary TV picks; enforced in code post-Claude
+
+# PriTag/Tags in the DB tab mix specific titles with platform names, genres, and
+# talent names — this blocklist excludes the non-title values so compute_top_tags
+# ranks actual movies/shows, not genre buzzwords. Not exhaustive; extend as new
+# non-title values show up in the ranked output.
+NON_TITLE_TAGS = {
+    "action", "thriller", "horror", "drama", "comedy", "sci-fi", "science fiction",
+    "western", "crime", "fantasy", "romance", "documentary", "reality", "animation",
+    "mystery", "war", "musical", "biography", "adventure", "true crime", "superhero",
+    "netflix", "hulu", "disney+", "disney plus", "hbo max", "max", "prime video",
+    "amazon prime", "paramount+", "paramount plus", "apple tv", "apple tv+",
+    "tubi", "peacock", "pluto",
+    "hot on streaming", "coming/leaving streaming", "coming soon", "leaving soon",
+    "streaming", "box office", "trailer", "news",
+}
 
 PLATFORM_IDS = {
     "cmp_IA6TdMqwf6kuyQvxo9bJ4nKX": "Netflix",
@@ -742,16 +757,36 @@ def log_suggestions(svc, picks, today_str):
 # REPEAT OPPORTUNITY — monthly tag scan + daily flag
 # ─────────────────────────────────────────────────────────────────────────────
 
+def _row_title(row):
+    """Best-effort resolve which specific movie/show a DB row is about.
+    PriTag is usually the subject, but sometimes holds the platform or a
+    person's name instead (e.g. PriTag="Prime Video" with the actual title
+    buried in Tags) — in that case fall back to the first non-generic Tags
+    entry. Not perfect: a row whose PriTag is a person's name (e.g. "Taylor
+    Sheridan") with no clearer Tags entry will still resolve to that name
+    rather than a title — there's no dedicated title column in this sheet
+    to disambiguate further."""
+    pri = row.get("PriTag", "").strip()
+    if pri and pri.lower() not in NON_TITLE_TAGS:
+        return pri
+    for t in row.get("Tags", "").split("|"):
+        t = t.strip()
+        if t and t.lower() not in NON_TITLE_TAGS:
+            return t
+    return ""
+
+
 def compute_top_tags(svc, top_n=TOP_TAGS_COUNT, lookback_days=TOP_TAGS_LOOKBACK_DAYS):
-    """Monthly job: rank Niche News tags by MW performance over the trailing year,
-    and record each tag's single best-performing headline (exact text) for reuse
-    when the tag resurfaces. Overwrites the TopTags tab — a current snapshot, not
-    an accumulating log, since only the latest ranking is useful for matching."""
+    """Monthly job: rank specific movie/show titles by MW performance over the
+    trailing year, and record each title's single best-performing headline
+    (exact text) for reuse when it resurfaces. Overwrites the TopTitles tab —
+    a current snapshot, not an accumulating log, since only the latest ranking
+    is useful for matching."""
     sheet_id = os.environ["PERF_SHEET_ID"]
     rows     = _read_tab(svc, sheet_id, "DB")
     cutoff   = date.today() - timedelta(days=lookback_days)
 
-    tag_stats = defaultdict(lambda: {
+    title_stats = defaultdict(lambda: {
         "weighted_score": 0.0, "tier1_count": 0, "tier1_heavy": 0,
         "best_sessions": -1, "best_headline": "", "sample_titles": [],
     })
@@ -765,63 +800,58 @@ def compute_top_tags(svc, top_n=TOP_TAGS_COUNT, lookback_days=TOP_TAGS_LOOKBACK_
             continue
         niche_count += 1
 
+        title = _row_title(row)
+        if not title:
+            continue
+
         try:
             sessions = int(str(row.get("ActSess", 0)).replace(",", "").strip())
         except Exception:
             sessions = 0
-        is_heavy   = sessions >= SESSIONS_HEAVY
-        title_text = row.get("ArticleTitle", "").strip()
+        is_heavy    = sessions >= SESSIONS_HEAVY
+        article_txt = row.get("ArticleTitle", "").strip()
 
-        tags = set()
-        pri = row.get("PriTag", "").strip()
-        if pri:
-            tags.add(pri.lower())
-        for t in row.get("Tags", "").split("|"):
-            t = t.strip()
-            if t:
-                tags.add(t.lower())
-
-        for tag in tags:
-            d = tag_stats[tag]
-            d["weighted_score"] += 1.0
-            d["tier1_count"]    += 1
-            if is_heavy:
-                d["tier1_heavy"] += 1
-                if len(d["sample_titles"]) < 3:
-                    d["sample_titles"].append(title_text)
-            if sessions > d["best_sessions"]:
-                d["best_sessions"] = sessions
-                d["best_headline"] = title_text
+        d = title_stats[title.lower()]
+        d["weighted_score"] += 1.0
+        d["tier1_count"]    += 1
+        if is_heavy:
+            d["tier1_heavy"] += 1
+            if len(d["sample_titles"]) < 3:
+                d["sample_titles"].append(article_txt)
+        if sessions > d["best_sessions"]:
+            d["best_sessions"] = sessions
+            d["best_headline"] = article_txt
 
     ranked = sorted(
-        tag_stats.items(),
+        title_stats.items(),
         key=lambda kv: (kv[1]["tier1_heavy"], kv[1]["weighted_score"]),
         reverse=True,
     )[:top_n]
 
     computed_date = date.today().isoformat()
     table_rows = [
-        [computed_date, tag, round(d["weighted_score"], 2), d["tier1_count"],
+        [computed_date, title, round(d["weighted_score"], 2), d["tier1_count"],
          d["tier1_heavy"], " | ".join(d["sample_titles"]), d["best_headline"]]
-        for tag, d in ranked
+        for title, d in ranked
     ]
 
     _overwrite_tab(svc, sheet_id, TOPTAGS_TAB, [
-        ["computed_date", "tag", "weighted_score", "tier1_count",
+        ["computed_date", "title", "weighted_score", "tier1_count",
          "tier1_heavy", "sample_titles", "best_headline"],
         *table_rows,
     ])
     log.info(
-        "TopTags: ranked %d tags from %d Niche News rows (past %d days)",
+        "TopTitles: ranked %d titles from %d Niche News rows (past %d days)",
         len(ranked), niche_count, lookback_days,
     )
     return ranked
 
 
 def load_top_tags(svc):
-    """Read the TopTags tab (written monthly by compute_top_tags) into a lookup dict.
-    Returns {} if the tab doesn't exist yet or is empty — fails open, meaning the
-    daily repeat-opportunity check simply finds nothing until the first monthly run."""
+    """Read the TopTitles tab (written monthly by compute_top_tags) into a lookup
+    dict keyed by lowercased title. Returns {} if the tab doesn't exist yet or is
+    empty — fails open, meaning the daily repeat-opportunity check simply finds
+    nothing until the first monthly run."""
     sheet_id = os.environ["PERF_SHEET_ID"]
     try:
         rows = _read_tab(svc, sheet_id, TOPTAGS_TAB)
@@ -829,15 +859,15 @@ def load_top_tags(svc):
         log.warning("Could not read %s tab: %s", TOPTAGS_TAB, e)
         return {}
     return {
-        r["tag"]: {"best_headline": r.get("best_headline", "")}
-        for r in rows if r.get("tag")
+        r["title"]: {"best_headline": r.get("best_headline", "")}
+        for r in rows if r.get("title")
     }
 
 
 def check_repeat_opportunities(all_titles, candidates, top_tags):
     """Flag titles anywhere in today's US Top 10 (not just the 6-pick candidate
     pool) whose title, cast, director, or franchise collection matches a
-    historically top-performing MW tag.
+    historically top-performing MW title (from compute_top_tags).
 
     Cast/director/collection matching only works for titles already TMDB-enriched
     (the top TITLES_TO_ENRICH momentum-scored candidates) — titles outside that
