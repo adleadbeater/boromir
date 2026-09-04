@@ -1,7 +1,7 @@
 name: Boromir Daily Run
 
 on:
-  workflow_dispatch:         # triggered by cron-job.org at 8am ET
+  workflow_dispatch:         # triggered by cron-job.org at 5am ET
 
 jobs:
   run:
