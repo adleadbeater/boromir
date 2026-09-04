@@ -50,6 +50,7 @@ USAGE_TAB            = "Usage"
 TOPTAGS_TAB          = "TopTitles"
 TOP_TITLES_MIN_HEAVY = 1   # qualifies as a "good performer" if it has >=1 heavy-session (SESSIONS_HEAVY) hit — no arbitrary top-N cap
 TOP_TAGS_LOOKBACK_DAYS = 730   # ~2 years — widened from 1 year to catch more titles
+REPEAT_OPP_SUPPRESS_DAYS = 60  # suppress a repeat-opportunity flag if its best article ran this recently
 TRUE_CRIME_DOC_CAP   = 1   # max true-crime/documentary TV picks; enforced in code post-Claude
 
 # PriTag/Tags in the DB tab mix specific titles with platform names, genres, and
@@ -876,7 +877,8 @@ def compute_top_tags(svc, min_heavy=TOP_TITLES_MIN_HEAVY, lookback_days=TOP_TAGS
 
     title_stats = defaultdict(lambda: {
         "weighted_score": 0.0, "tier1_count": 0, "tier1_heavy": 0,
-        "best_sessions": -1, "best_headline": "", "best_url": "", "sample_titles": [],
+        "best_sessions": -1, "best_headline": "", "best_url": "", "best_pub_date": "",
+        "sample_titles": [],
     })
     niche_count  = 0
     skipped_name = 0
@@ -910,9 +912,10 @@ def compute_top_tags(svc, min_heavy=TOP_TITLES_MIN_HEAVY, lookback_days=TOP_TAGS
             if len(d["sample_titles"]) < 3:
                 d["sample_titles"].append(article_txt)
         if sessions > d["best_sessions"]:
-            d["best_sessions"] = sessions
-            d["best_headline"] = article_txt
-            d["best_url"]      = article_url
+            d["best_sessions"]  = sessions
+            d["best_headline"]  = article_txt
+            d["best_url"]       = article_url
+            d["best_pub_date"]  = pub_date.isoformat()
 
     ranked = sorted(
         (item for item in title_stats.items() if item[1]["tier1_heavy"] >= min_heavy),
@@ -931,13 +934,14 @@ def compute_top_tags(svc, min_heavy=TOP_TITLES_MIN_HEAVY, lookback_days=TOP_TAGS
     computed_date = date.today().isoformat()
     table_rows = [
         [computed_date, title, round(d["weighted_score"], 2), d["tier1_count"],
-         d["tier1_heavy"], " | ".join(d["sample_titles"]), d["best_headline"], d["best_url"]]
+         d["tier1_heavy"], " | ".join(d["sample_titles"]), d["best_headline"],
+         d["best_url"], d["best_pub_date"]]
         for title, d in ranked
     ]
 
     _overwrite_tab(svc, sheet_id, TOPTAGS_TAB, [
         ["computed_date", "title", "weighted_score", "tier1_count",
-         "tier1_heavy", "sample_titles", "best_headline", "best_url"],
+         "tier1_heavy", "sample_titles", "best_headline", "best_url", "best_pub_date"],
         *table_rows,
     ])
     log.info(
@@ -963,12 +967,13 @@ def load_top_tags(svc):
         r["title"]: {
             "best_headline": r.get("best_headline", ""),
             "best_url":      r.get("best_url", ""),
+            "best_pub_date": r.get("best_pub_date", ""),
         }
         for r in rows if r.get("title")
     }
 
 
-def check_repeat_opportunities(all_titles, candidates, top_tags):
+def check_repeat_opportunities(all_titles, candidates, top_tags, today):
     """Flag titles anywhere in today's US Top 10 (not just the 6-pick candidate
     pool) whose title, cast, director, or franchise collection matches a
     historically top-performing MW title (from compute_top_tags).
@@ -976,11 +981,16 @@ def check_repeat_opportunities(all_titles, candidates, top_tags):
     Cast/director/collection matching only works for titles already TMDB-enriched
     (the top TITLES_TO_ENRICH momentum-scored candidates) — titles outside that
     set are matched on their raw title string only.
+
+    A match is suppressed if its best article ran within the last
+    REPEAT_OPP_SUPPRESS_DAYS — too soon to call it a "repeat" opportunity if
+    MW just covered it.
     """
     if not top_tags:
         return []
     candidate_tmdb = {t["flixpatrol_id"]: t.get("tmdb", {}) for t in candidates}
-    hits, seen = [], set()
+    hits, seen  = [], set()
+    suppressed  = 0
 
     for t in all_titles:
         if not t.get("top10"):
@@ -1004,6 +1014,12 @@ def check_repeat_opportunities(all_titles, candidates, top_tags):
         if not match_tag:
             continue
 
+        info         = top_tags[match_tag]
+        best_pubdate = _parse_date(info.get("best_pub_date", ""))
+        if best_pubdate and (today - best_pubdate).days < REPEAT_OPP_SUPPRESS_DAYS:
+            suppressed += 1
+            continue
+
         best_plat, best_rank, best_key = "", None, (99, 99)
         for p, types in t["top10"].items():
             tier = TIER_MAP.get(p, 5)
@@ -1018,10 +1034,15 @@ def check_repeat_opportunities(all_titles, candidates, top_tags):
             "tag":           match_tag,
             "platform":      best_plat,
             "rank":          best_rank,
-            "best_headline": top_tags[match_tag].get("best_headline", ""),
-            "best_url":      top_tags[match_tag].get("best_url", ""),
+            "best_headline": info.get("best_headline", ""),
+            "best_url":      info.get("best_url", ""),
         })
 
+    if suppressed:
+        log.info(
+            "Repeat Opportunity: suppressed %d match(es) published within last %d days",
+            suppressed, REPEAT_OPP_SUPPRESS_DAYS,
+        )
     return hits
 
 
@@ -1763,7 +1784,7 @@ def run():
     # 10. Repeat-opportunity check (monthly tag list, checked daily against
     #     every title in today's US Top 10 — not just the 6-pick candidates)
     top_tags    = load_top_tags(svc)
-    repeat_hits = check_repeat_opportunities(all_titles, candidates, top_tags)
+    repeat_hits = check_repeat_opportunities(all_titles, candidates, top_tags, today)
     if repeat_hits:
         time.sleep(1)
         repeat_msg = build_repeat_opportunity_message(repeat_hits, today)
