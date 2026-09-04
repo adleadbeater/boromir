@@ -774,26 +774,21 @@ def _mentioned_names(rows):
 
 
 def _row_title(row, mentioned_people=frozenset()):
-    """Best-effort resolve which specific movie/show a DB row is about,
-    excluding platforms/genres (NON_TITLE_TAGS) and talent names
-    (mentioned_people). PriTag is usually the subject, but sometimes holds
-    the platform or a person's name instead — in that case fall back to the
-    first valid Tags entry. There's no dedicated title column in this sheet:
-    a row whose only tag is a talent name with no other identifiable title
-    (e.g. PriTag="Jason Statham", Tags="Action|Thriller") has no recoverable
-    title and is skipped entirely — better to drop it than mislabel a person
-    as a movie."""
-    def _valid(v):
-        vl = v.strip().lower()
-        return bool(vl) and vl not in NON_TITLE_TAGS and vl not in mentioned_people
+    """Resolve which specific movie/show a DB row is about, using PriTag only.
 
+    Tags entries are NOT used as a fallback — they're secondary/comparison
+    references (other shows mentioned for context, e.g. an article about a
+    Taylor Sheridan documentary tagged with "Landman" as a related show), not
+    reliably the row's actual subject. Trusting them caused false matches:
+    titles get attributed a "best headline" that was actually about something
+    else entirely. A row whose PriTag is a platform, genre (NON_TITLE_TAGS),
+    or a person's name (mentioned_people, extracted from headline text) has
+    no recoverable title here and is skipped — this trades away some coverage
+    for not mislabeling what a headline was actually about."""
     pri = row.get("PriTag", "").strip()
-    if _valid(pri):
+    vl  = pri.lower()
+    if vl and vl not in NON_TITLE_TAGS and vl not in mentioned_people:
         return pri
-    for t in row.get("Tags", "").split("|"):
-        t = t.strip()
-        if _valid(t):
-            return t
     return ""
 
 
