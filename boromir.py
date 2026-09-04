@@ -877,8 +877,8 @@ def compute_top_tags(svc, min_heavy=TOP_TITLES_MIN_HEAVY, lookback_days=TOP_TAGS
 
     title_stats = defaultdict(lambda: {
         "weighted_score": 0.0, "tier1_count": 0, "tier1_heavy": 0,
-        "best_sessions": -1, "best_headline": "", "best_url": "", "best_pub_date": "",
-        "sample_titles": [],
+        "best_sessions": -1, "best_headline": "", "best_url": "",
+        "last_pub_date": None, "sample_titles": [],
     })
     niche_count  = 0
     skipped_name = 0
@@ -912,10 +912,14 @@ def compute_top_tags(svc, min_heavy=TOP_TITLES_MIN_HEAVY, lookback_days=TOP_TAGS
             if len(d["sample_titles"]) < 3:
                 d["sample_titles"].append(article_txt)
         if sessions > d["best_sessions"]:
-            d["best_sessions"]  = sessions
-            d["best_headline"]  = article_txt
-            d["best_url"]       = article_url
-            d["best_pub_date"]  = pub_date.isoformat()
+            d["best_sessions"] = sessions
+            d["best_headline"] = article_txt
+            d["best_url"]      = article_url
+        # last_pub_date tracks the most recent article on this title from ANY
+        # row, independent of which row had the best-performing headline —
+        # used to suppress flagging something MW just covered.
+        if d["last_pub_date"] is None or pub_date > d["last_pub_date"]:
+            d["last_pub_date"] = pub_date
 
     ranked = sorted(
         (item for item in title_stats.items() if item[1]["tier1_heavy"] >= min_heavy),
@@ -935,13 +939,13 @@ def compute_top_tags(svc, min_heavy=TOP_TITLES_MIN_HEAVY, lookback_days=TOP_TAGS
     table_rows = [
         [computed_date, title, round(d["weighted_score"], 2), d["tier1_count"],
          d["tier1_heavy"], " | ".join(d["sample_titles"]), d["best_headline"],
-         d["best_url"], d["best_pub_date"]]
+         d["best_url"], d["last_pub_date"].isoformat() if d["last_pub_date"] else ""]
         for title, d in ranked
     ]
 
     _overwrite_tab(svc, sheet_id, TOPTAGS_TAB, [
         ["computed_date", "title", "weighted_score", "tier1_count",
-         "tier1_heavy", "sample_titles", "best_headline", "best_url", "best_pub_date"],
+         "tier1_heavy", "sample_titles", "best_headline", "best_url", "last_pub_date"],
         *table_rows,
     ])
     log.info(
@@ -967,7 +971,7 @@ def load_top_tags(svc):
         r["title"]: {
             "best_headline": r.get("best_headline", ""),
             "best_url":      r.get("best_url", ""),
-            "best_pub_date": r.get("best_pub_date", ""),
+            "last_pub_date": r.get("last_pub_date", ""),
         }
         for r in rows if r.get("title")
     }
@@ -982,9 +986,9 @@ def check_repeat_opportunities(all_titles, candidates, top_tags, today):
     (the top TITLES_TO_ENRICH momentum-scored candidates) — titles outside that
     set are matched on their raw title string only.
 
-    A match is suppressed if its best article ran within the last
-    REPEAT_OPP_SUPPRESS_DAYS — too soon to call it a "repeat" opportunity if
-    MW just covered it.
+    A match is suppressed if ANY article about it ran within the last
+    REPEAT_OPP_SUPPRESS_DAYS (not just its best-performing one) — too soon to
+    call it a "repeat" opportunity if MW covered it at all recently.
     """
     if not top_tags:
         return []
@@ -1014,9 +1018,9 @@ def check_repeat_opportunities(all_titles, candidates, top_tags, today):
         if not match_tag:
             continue
 
-        info         = top_tags[match_tag]
-        best_pubdate = _parse_date(info.get("best_pub_date", ""))
-        if best_pubdate and (today - best_pubdate).days < REPEAT_OPP_SUPPRESS_DAYS:
+        info          = top_tags[match_tag]
+        last_pub_date = _parse_date(info.get("last_pub_date", ""))
+        if last_pub_date and (today - last_pub_date).days < REPEAT_OPP_SUPPRESS_DAYS:
             suppressed += 1
             continue
 
