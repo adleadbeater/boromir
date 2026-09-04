@@ -49,7 +49,7 @@ SUPPRESS_DAYS        = 2
 USAGE_TAB            = "Usage"
 TOPTAGS_TAB          = "TopTitles"
 TOP_TITLES_MIN_HEAVY = 1   # qualifies as a "good performer" if it has >=1 heavy-session (SESSIONS_HEAVY) hit — no arbitrary top-N cap
-TOP_TAGS_LOOKBACK_DAYS = 365
+TOP_TAGS_LOOKBACK_DAYS = 730   # ~2 years — widened from 1 year to catch more titles
 TRUE_CRIME_DOC_CAP   = 1   # max true-crime/documentary TV picks; enforced in code post-Claude
 
 # PriTag/Tags in the DB tab mix specific titles with platform names, genres, and
@@ -779,6 +779,7 @@ def _filter_reusable_headlines(candidates):
 Exclude any headline that is:
 - Comparative — frames the title by beating, toppling, dethroning, or being measured against another title (e.g. "X Topples Y", "X Beats Y for the Crown")
 - Negative — frames the title as failing, declining, disappointing, or struggling (e.g. "Suffers Major Setback", "Flops", "Fails to Deliver")
+- Departure/urgency framing — implies the title is about to leave or expire (e.g. "About to Leave Streaming", "Leaving Soon") — this reads as confusing or stale once reused on a different day
 
 Headlines:
 {json.dumps(items, ensure_ascii=False, indent=2)}
@@ -875,7 +876,7 @@ def compute_top_tags(svc, min_heavy=TOP_TITLES_MIN_HEAVY, lookback_days=TOP_TAGS
 
     title_stats = defaultdict(lambda: {
         "weighted_score": 0.0, "tier1_count": 0, "tier1_heavy": 0,
-        "best_sessions": -1, "best_headline": "", "sample_titles": [],
+        "best_sessions": -1, "best_headline": "", "best_url": "", "sample_titles": [],
     })
     niche_count  = 0
     skipped_name = 0
@@ -899,6 +900,7 @@ def compute_top_tags(svc, min_heavy=TOP_TITLES_MIN_HEAVY, lookback_days=TOP_TAGS
             sessions = 0
         is_heavy    = sessions >= SESSIONS_HEAVY
         article_txt = row.get("ArticleTitle", "").strip()
+        article_url = row.get("URL", "").strip()
 
         d = title_stats[title.lower()]
         d["weighted_score"] += 1.0
@@ -910,6 +912,7 @@ def compute_top_tags(svc, min_heavy=TOP_TITLES_MIN_HEAVY, lookback_days=TOP_TAGS
         if sessions > d["best_sessions"]:
             d["best_sessions"] = sessions
             d["best_headline"] = article_txt
+            d["best_url"]      = article_url
 
     ranked = sorted(
         (item for item in title_stats.items() if item[1]["tier1_heavy"] >= min_heavy),
@@ -928,13 +931,13 @@ def compute_top_tags(svc, min_heavy=TOP_TITLES_MIN_HEAVY, lookback_days=TOP_TAGS
     computed_date = date.today().isoformat()
     table_rows = [
         [computed_date, title, round(d["weighted_score"], 2), d["tier1_count"],
-         d["tier1_heavy"], " | ".join(d["sample_titles"]), d["best_headline"]]
+         d["tier1_heavy"], " | ".join(d["sample_titles"]), d["best_headline"], d["best_url"]]
         for title, d in ranked
     ]
 
     _overwrite_tab(svc, sheet_id, TOPTAGS_TAB, [
         ["computed_date", "title", "weighted_score", "tier1_count",
-         "tier1_heavy", "sample_titles", "best_headline"],
+         "tier1_heavy", "sample_titles", "best_headline", "best_url"],
         *table_rows,
     ])
     log.info(
@@ -957,12 +960,15 @@ def load_top_tags(svc):
         log.warning("Could not read %s tab: %s", TOPTAGS_TAB, e)
         return {}
     return {
-        r["title"]: {"best_headline": r.get("best_headline", "")}
+        r["title"]: {
+            "best_headline": r.get("best_headline", ""),
+            "best_url":      r.get("best_url", ""),
+        }
         for r in rows if r.get("title")
     }
 
 
-def check_repeat_opportunities(all_titles, candidates, top_tags):
+def check_repeat_opportunities(all_titles, candidates, top_tags, http_session):
     """Flag titles anywhere in today's US Top 10 (not just the 6-pick candidate
     pool) whose title, cast, director, or franchise collection matches a
     historically top-performing MW title (from compute_top_tags).
@@ -970,6 +976,12 @@ def check_repeat_opportunities(all_titles, candidates, top_tags):
     Cast/director/collection matching only works for titles already TMDB-enriched
     (the top TITLES_TO_ENRICH momentum-scored candidates) — titles outside that
     set are matched on their raw title string only.
+
+    For each match, resolves a plain descriptive overview of the show (TMDB
+    enrichment already exists for candidates; fetched fresh for the small
+    number of non-candidate matches) rather than reusing MW's own headline
+    text — editors asked for a neutral description + the original article
+    link, not a repurposed headline.
     """
     if not top_tags:
         return []
@@ -1006,13 +1018,18 @@ def check_repeat_opportunities(all_titles, candidates, top_tags):
                 if (tier, r) < best_key:
                     best_key, best_plat, best_rank = (tier, r), p, data.get("ranking")
 
+        tmdb = candidate_tmdb.get(t["flixpatrol_id"])
+        if tmdb is None:
+            tmdb = fetch_tmdb(http_session, t)
+
         seen.add(norm_title)
         hits.append({
             "title":         t["title"],
             "tag":           match_tag,
             "platform":      best_plat,
             "rank":          best_rank,
-            "best_headline": top_tags[match_tag].get("best_headline", ""),
+            "overview":      tmdb.get("overview", ""),
+            "best_url":      top_tags[match_tag].get("best_url", ""),
         })
 
     return hits
@@ -1020,7 +1037,9 @@ def check_repeat_opportunities(all_titles, candidates, top_tags):
 
 def build_repeat_opportunity_message(hits, today):
     """Format repeat-opportunity flags as their own Slack message, clearly
-    separate from Boromir's 6 daily picks."""
+    separate from Boromir's 6 daily picks. Shows a plain description of the
+    show plus a link to the original MW article (so editors can see the
+    image) rather than reusing MW's own headline text."""
     if not hits:
         return None
     date_str = today.strftime("%A, %B %-d")
@@ -1028,11 +1047,12 @@ def build_repeat_opportunity_message(hits, today):
     for h in hits:
         plat_str = f"{h['platform']} #{h['rank']}" if h["platform"] else "—"
         lines.append(f"*{h['title']}*  ({plat_str})")
-        lines.append(f"Matched tag: {h['tag']}")
-        if h["best_headline"]:
-            lines.append(f"Reuse framing: “{h['best_headline']}”")
+        if h["overview"]:
+            lines.append(h["overview"][:280])
+        if h["best_url"]:
+            lines.append(f"Article: {h['best_url']}")
         lines.append("")
-    return {"text": "\n".join(lines).strip(), "unfurl_links": False, "unfurl_media": False}
+    return {"text": "\n".join(lines).strip(), "unfurl_links": True, "unfurl_media": True}
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1754,7 +1774,7 @@ def run():
     # 10. Repeat-opportunity check (monthly tag list, checked daily against
     #     every title in today's US Top 10 — not just the 6-pick candidates)
     top_tags    = load_top_tags(svc)
-    repeat_hits = check_repeat_opportunities(all_titles, candidates, top_tags)
+    repeat_hits = check_repeat_opportunities(all_titles, candidates, top_tags, http)
     if repeat_hits:
         time.sleep(1)
         repeat_msg = build_repeat_opportunity_message(repeat_hits, today)
