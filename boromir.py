@@ -757,6 +757,74 @@ def log_suggestions(svc, picks, today_str):
 # REPEAT OPPORTUNITY — monthly tag scan + daily flag
 # ─────────────────────────────────────────────────────────────────────────────
 
+def _filter_reusable_headlines(candidates):
+    """Use Claude to drop headlines unsuitable for reuse as repeat-opportunity
+    framing: comparative ("X Topples Y") or negative ("Suffers Major Setback")
+    headlines don't work when resurfaced standalone for a different day's
+    story about the same title. One call per monthly run — cheap, and worth
+    it since this feeds directly into what gets suggested to editors.
+
+    candidates: list of {"title": ..., "best_headline": ...}
+    Returns the subset whose headline is standalone/positive. Fails open —
+    a Claude or parsing error returns all candidates unfiltered rather than
+    blocking the monthly job.
+    """
+    if not candidates:
+        return candidates
+    try:
+        client = anthropic.Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
+        items  = [{"title": c["title"], "headline": c["best_headline"]} for c in candidates]
+        prompt = f"""Below is a list of headlines, each about a specific movie or TV show. We want to reuse each headline's framing later when the same title resurfaces on a streaming chart — so a headline only qualifies if it stands alone as positive/neutral coverage of that title.
+
+Exclude any headline that is:
+- Comparative — frames the title by beating, toppling, dethroning, or being measured against another title (e.g. "X Topples Y", "X Beats Y for the Crown")
+- Negative — frames the title as failing, declining, disappointing, or struggling (e.g. "Suffers Major Setback", "Flops", "Fails to Deliver")
+
+Headlines:
+{json.dumps(items, ensure_ascii=False, indent=2)}
+
+Return valid JSON only, no markdown: {{"keep_titles": ["title1", "title2", ...]}} — the titles (exact match) whose headline should be KEPT (i.e. NOT comparative and NOT negative)."""
+
+        response = client.messages.create(
+            model="claude-sonnet-4-6",
+            max_tokens=2048,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        u = response.usage
+        log.info(
+            "claude_usage  input=%s  output=%s  cache_read=%s  cache_write=%s",
+            u.input_tokens, u.output_tokens,
+            getattr(u, "cache_read_input_tokens", 0),
+            getattr(u, "cache_creation_input_tokens", 0),
+        )
+        _USAGE_LOG.append({
+            "timestamp":     datetime.now(timezone.utc).isoformat(),
+            "call_label":    "toptitles_filter",
+            "input_tokens":  u.input_tokens,
+            "output_tokens": u.output_tokens,
+            "cache_created": getattr(u, "cache_creation_input_tokens", 0),
+            "cache_read":    getattr(u, "cache_read_input_tokens", 0),
+            "model":         "claude-sonnet-4-6",
+        })
+
+        raw = response.content[0].text.strip()
+        if raw.startswith("```"):
+            raw = raw.split("\n", 1)[1].rsplit("```", 1)[0].strip()
+        start, end = raw.find("{"), raw.rfind("}")
+        if start != -1 and end > start:
+            raw = raw[start:end + 1]
+
+        keep     = {t.strip().lower() for t in json.loads(raw).get("keep_titles", [])}
+        filtered = [c for c in candidates if c["title"].strip().lower() in keep]
+        log.info(
+            "Headline filter: kept %d/%d (dropped comparative/negative framing)",
+            len(filtered), len(candidates),
+        )
+        return filtered
+    except Exception as e:
+        log.warning("Could not filter headlines via Claude — keeping all unfiltered: %s", e)
+        return candidates
+
 def _mentioned_names(rows):
     """Extract person names from historical headline text, using the same
     pattern already used for talent-performance tracking (see load_perf_data's
@@ -848,6 +916,14 @@ def compute_top_tags(svc, min_heavy=TOP_TITLES_MIN_HEAVY, lookback_days=TOP_TAGS
         key=lambda kv: (kv[1]["tier1_heavy"], kv[1]["weighted_score"]),
         reverse=True,
     )
+
+    # Drop titles whose best headline is comparative or negative framing —
+    # unsuitable for reuse when the title resurfaces standalone later.
+    kept = _filter_reusable_headlines([
+        {"title": title, "best_headline": d["best_headline"]} for title, d in ranked
+    ])
+    kept_titles = {c["title"] for c in kept}
+    ranked = [(title, d) for title, d in ranked if title in kept_titles]
 
     computed_date = date.today().isoformat()
     table_rows = [
@@ -1702,6 +1778,7 @@ def run_monthly_tags():
     log.info("=" * 52)
     svc = _sheets_service()
     compute_top_tags(svc)
+    flush_usage_to_sheet(svc)
 
 
 if __name__ == "__main__":
